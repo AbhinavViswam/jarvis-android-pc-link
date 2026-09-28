@@ -172,13 +172,16 @@ class Replays:
     def __init__(self):
         self._seen: dict[bytes, float] = {}
         self._lock = threading.Lock()
+        self._pruned = 0.0
 
     def fresh(self, nonce: bytes) -> bool:
         now = time.time()
         with self._lock:
-            for n, t in list(self._seen.items()):
-                if now - t > MAX_SKEW_S * 2:
-                    del self._seen[n]
+            if now - self._pruned > 1:
+                self._pruned = now
+                for n, t in list(self._seen.items()):
+                    if now - t > MAX_SKEW_S * 2:
+                        del self._seen[n]
             if nonce in self._seen:
                 return False
             self._seen[nonce] = now
@@ -186,6 +189,10 @@ class Replays:
 
 
 REPLAYS = Replays()
+
+# Many to a second, or one piece of a file: not written to the log one by one.
+QUIET_ACTIONS = {"file_chunk", "file_get_chunk", "pointer", "key"}
+_last_seen_saved: dict[str, int] = {}
 
 
 # ---------------------------------------------------------------------------------------------- pairing
@@ -282,12 +289,15 @@ def handle_cmd(req: dict) -> dict:
     except Exception as e:  # an action failing must never take the link down
         log.exception("action %s failed", action)
         ok, text, data = False, f"That failed on the PC: {e.__class__.__name__}.", None
-    if action not in ("file_chunk", "file_get_chunk"):
+    if action not in QUIET_ACTIONS:
         log.info("%s from %s: %s", action, entry.get("name", "?"), "ok" if ok else "failed")
-    p = paired()
-    if device in p:
-        p[device]["last_seen"] = int(time.time())
-        save_paired(p)
+    now = int(time.time())
+    if now - _last_seen_saved.get(device, 0) > 60:
+        _last_seen_saved[device] = now
+        p = paired()
+        if device in p:
+            p[device]["last_seen"] = now
+            save_paired(p)
     return {"ok": True, "box": seal(key, {"ok": ok, "text": text, "data": data}, b"reply:" + device.encode())}
 
 
@@ -493,12 +503,45 @@ def act_open_url(args):
     return True, "Opened the link on the PC.", None
 
 
+MAX_CLIP = 20_000
+
+
 def act_clipboard(args):
     text = str(args.get("text", ""))[:10_000]
     if not text:
         return False, "Nothing to copy.", None
     subprocess.run(["clip"], input=text.encode("utf-16-le"), check=True, creationflags=0x08000000)
     return True, "Copied to the PC's clipboard.", None
+
+
+def act_clipboard_get(args):
+    """The text on the PC's clipboard (not pictures or files), for the phone's clipboard."""
+    k32 = ctypes.windll.kernel32
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalLock.argtypes = [ctypes.c_void_p]
+    k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    _u32.GetClipboardData.restype = ctypes.c_void_p
+    text = None
+    for _ in range(5):  # another app may have it open for a moment
+        if _u32.OpenClipboard(None):
+            break
+        time.sleep(0.05)
+    else:
+        return False, "The PC's clipboard is busy; try again.", None
+    try:
+        h = _u32.GetClipboardData(13)  # CF_UNICODETEXT
+        if h:
+            ptr = k32.GlobalLock(h)
+            if ptr:
+                try:
+                    text = ctypes.wstring_at(ptr)
+                finally:
+                    k32.GlobalUnlock(h)
+    finally:
+        _u32.CloseClipboard()
+    if not text:
+        return False, f"There's no text copied on {PC_NAME}.", None
+    return True, f"Took {len(text)} characters from {PC_NAME}'s clipboard.", {"text": text[:MAX_CLIP]}
 
 
 def act_lock(args):
@@ -748,8 +791,16 @@ _SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd
 
 def open_apps() -> dict[str, int]:
     """The programs with a window open on the desktop (minimised ones too), and how many windows each: names only."""
-    dwm = ctypes.WinDLL("dwmapi")
     found: dict[str, int] = {}
+    for name, _ in app_windows():
+        found[name] = found.get(name, 0) + 1
+    return found
+
+
+def app_windows() -> list[tuple[str, int]]:
+    """Each app window on the desktop (minimised ones too), front-most first, with its program's name."""
+    dwm = ctypes.WinDLL("dwmapi")
+    found: list[tuple[str, int]] = []
     me = os.getpid()
 
     def pid_of(hwnd) -> int:
@@ -788,8 +839,7 @@ def open_apps() -> dict[str, int]:
                 _u32.EnumChildWindows(hwnd, _WNDENUMPROC(on_child), 0)
                 exe = _exe_of(inner[0]) if inner else None
             if exe:
-                name = app_name(exe)
-                found[name] = found.get(name, 0) + 1
+                found.append((app_name(exe), int(hwnd)))
         except Exception:
             pass
         return True
@@ -805,6 +855,50 @@ def act_open_apps(args):
     names = sorted(apps, key=str.lower)
     said = [f"{n} ({apps[n]} windows)" if apps[n] > 1 else n for n in names]
     return True, f"Open on {PC_NAME}: " + ", ".join(said) + ".", {"apps": [{"name": n, "windows": apps[n]} for n in names]}
+
+
+def _windows_of(query: str) -> tuple[str | None, list[int], list[str]]:
+    """The app [query] means, among those with a window open, and its windows; else the open apps' names."""
+    wins = app_windows()
+    names = list(dict.fromkeys(n for n, _ in wins))
+    name, _ = best_match(query, names)
+    return name, [h for n, h in wins if n == name], names
+
+
+def act_close_app(args):
+    """Closes an app's windows the way the X button does: apps with unsaved work still ask. Never forced."""
+    query = str(args.get("name", "")).strip()
+    if not query:
+        return False, "Which app should I close?", None
+    name, hwnds, names = _windows_of(query)
+    if not name:
+        return False, f"{query} isn't open on {PC_NAME}. Open: " + (", ".join(sorted(names, key=str.lower)) or "nothing") + ".", None
+    for h in hwnds:
+        _u32.PostMessageW(wintypes.HWND(h), 0x0010, 0, 0)  # WM_CLOSE
+    return True, f"Closing {name} on {PC_NAME}" + (f" ({len(hwnds)} windows)" if len(hwnds) > 1 else "") + ". If it has unsaved work, it will ask there.", {"app": name}
+
+
+def act_switch_to(args):
+    """Brings an open app's window to the front (restoring it if minimised)."""
+    query = str(args.get("name", "")).strip()
+    if not query:
+        return False, "Which app should I switch to?", None
+    name, hwnds, names = _windows_of(query)
+    if not name:
+        return False, f"{query} isn't open on {PC_NAME}. Open: " + (", ".join(sorted(names, key=str.lower)) or "nothing") + ".", None
+    h = wintypes.HWND(hwnds[0])
+    if _u32.IsIconic(h):
+        _u32.ShowWindow(h, 9)  # SW_RESTORE
+    # Windows only lets the app the user last used take the front; a tap of Alt counts as using this one.
+    _keys([(0x12, 0, 0), (0x12, 0, 2)])
+    _u32.SetForegroundWindow(h)
+    return True, f"Switched to {name} on {PC_NAME}.", {"app": name}
+
+
+def act_show_desktop(args):
+    """Win+D: everything out of the way, and back again the second time."""
+    _keys([(0x5B, 0, 0), (0x44, 0, 0), (0x44, 0, 2), (0x5B, 0, 2)])
+    return True, f"Showing the desktop on {PC_NAME} (say it again to bring the windows back).", None
 
 
 # Browsers' unfinished downloads: Chrome/Edge .crdownload, Firefox .part, old Edge .partial, Opera .opdownload.
@@ -1087,6 +1181,83 @@ def act_type(args):
         time.sleep(0.01)
     said = f"Typed {len(text)} characters into {app}" if text else f"Pressed Enter in {app}"
     return True, said + (" and pressed Enter." if enter and text else "."), {"app": app}
+
+
+class _MouseInput(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _MInput(ctypes.Structure):
+    class _U(ctypes.Union):
+        _fields_ = [("mi", _MouseInput), ("pad", ctypes.c_byte * 32)]
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+
+def _mouse(events: list[tuple[int, int, int, int]]):
+    """(dx, dy, data, flags) mouse events, sent together."""
+    arr = (_MInput * len(events))()
+    for i, (dx, dy, data, flags) in enumerate(events):
+        arr[i].type = 0  # INPUT_MOUSE
+        arr[i].mi = _MouseInput(dx, dy, ctypes.c_uint32(data).value, flags, 0, 0)
+    ctypes.windll.user32.SendInput(len(events), arr, ctypes.sizeof(_MInput))
+
+
+_BUTTONS = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010), "middle": (0x0020, 0x0040)}
+
+
+def act_pointer(args):
+    """The phone's touchpad: move by dx/dy, click / double / right / middle, press and release (drag), scroll."""
+    ev: list[tuple[int, int, int, int]] = []
+    dx = max(-2000, min(2000, int(args.get("dx", 0) or 0)))
+    dy = max(-2000, min(2000, int(args.get("dy", 0) or 0)))
+    if dx or dy:
+        ev.append((dx, dy, 0, 0x0001))  # MOUSEEVENTF_MOVE
+    click = str(args.get("click", "") or "")
+    if click:
+        down, up = _BUTTONS.get("right" if click == "right" else "middle" if click == "middle" else "left")
+        if click == "down":
+            ev.append((0, 0, 0, down))
+        elif click == "up":
+            ev.append((0, 0, 0, up))
+        else:
+            ev += [(0, 0, 0, down), (0, 0, 0, up)] * (2 if click == "double" else 1)
+    scroll = max(-20, min(20, int(args.get("scroll", 0) or 0)))
+    if scroll:
+        ev.append((0, 0, scroll * 120, 0x0800))  # MOUSEEVENTF_WHEEL, one notch = 120
+    hscroll = max(-20, min(20, int(args.get("hscroll", 0) or 0)))
+    if hscroll:
+        ev.append((0, 0, hscroll * 120, 0x1000))  # MOUSEEVENTF_HWHEEL
+    if ev:
+        _mouse(ev)
+    return True, "", None
+
+
+# The touchpad's keys: the ones a phone keyboard doesn't type as text.
+_NAMED_KEYS = {
+    "enter": 0x0D, "backspace": 0x08, "tab": 0x09, "escape": 0x1B, "space": 0x20, "delete": 0x2E,
+    "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28, "home": 0x24, "end": 0x23, "page_up": 0x21, "page_down": 0x22,
+    "windows": 0x5B, "f5": 0x74, "f11": 0x7B,
+}
+_MODS = {"ctrl": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B}
+
+
+def act_key(args):
+    """One key from the touchpad's keyboard, with ctrl / alt / shift / win held if asked (ctrl+c, alt+tab…)."""
+    name = str(args.get("key", "")).lower()
+    vk = _NAMED_KEYS.get(name)
+    if vk is None and len(name) == 1 and name.isalnum():
+        vk = ord(name.upper())
+    if vk is None:
+        return False, "Keys: " + ", ".join(_NAMED_KEYS) + ", or a letter or digit with a modifier.", None
+    mods = [_MODS[m] for m in str(args.get("mods", "")).lower().split("+") if m in _MODS]
+    if name not in _NAMED_KEYS and not set(mods) & {0x11, 0x12, 0x5B}:
+        # Letters on their own are typing, which goes through act_type (never into a terminal).
+        return False, "Letters and digits go with ctrl, alt or win here; type text instead.", None
+    events = [(m, 0, 0) for m in mods] + [(vk, 0, 0), (vk, 0, 2)] + [(m, 0, 2) for m in reversed(mods)]
+    _keys(events)
+    return True, "", None
 
 
 # ---------------------------------------------------------------------------------------------- files from the phone
@@ -1429,6 +1600,12 @@ ACTIONS = {
     "restart": act_restart,
     "cancel_shutdown": act_cancel_shutdown,
     "type": act_type,
+    "close_app": act_close_app,
+    "switch_to": act_switch_to,
+    "show_desktop": act_show_desktop,
+    "clipboard_get": act_clipboard_get,
+    "pointer": act_pointer,
+    "key": act_key,
 }
 
 
@@ -1487,19 +1664,28 @@ class Handler(socketserver.BaseRequestHandler):
         if not re.match(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.)", peer):
             return
         try:
-            req = read_frame(self.request)
-            if not req:
-                return
-            t = req.get("t")
-            if t == "hello":
-                reply = {"ok": True, "id": AGENT_ID, "name": PC_NAME, "v": VERSION}
-            elif t == "pair":
-                reply = handle_pair(req)
-            elif t == "cmd":
-                reply = handle_cmd(req)
-            else:
-                reply = {"ok": False, "error": "unknown"}
-            write_frame(self.request, reply)
+            first = True
+            while True:
+                try:
+                    req = read_frame(self.request)
+                except (socket.timeout, ConnectionError):
+                    return
+                if not req:
+                    return
+                t = req.get("t")
+                if t == "hello":
+                    reply = {"ok": True, "id": AGENT_ID, "name": PC_NAME, "v": VERSION}
+                elif t == "pair":
+                    reply = handle_pair(req)
+                elif t == "cmd":
+                    reply = handle_cmd(req)
+                else:
+                    reply = {"ok": False, "error": "unknown"}
+                write_frame(self.request, reply)
+                if first:
+                    # Kept open for the next request (the touchpad), and closed after a minute of nothing.
+                    first = False
+                    self.request.settimeout(60)
         except Exception:
             log.exception("request from %s failed", peer)
 

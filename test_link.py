@@ -92,5 +92,18 @@ assert cmd("volume")["ok"] and "volume" in cmd("volume")["text"]
 assert cmd("brightness")["text"]  # a desktop PC says it can't; a laptop says the level
 assert "Nothing was going to" in cmd("cancel_shutdown")["text"]
 assert not cmd("type")["ok"]
+# Windows and the clipboard, harmlessly: nothing is closed, switched, moved or clicked, and the clipboard isn't printed.
+assert not cmd("close_app", {"name": "no-such-app-xyz"})["ok"]
+assert not cmd("switch_to", {"name": "no-such-app-xyz"})["ok"]
+clip = cmd("clipboard_get")
+assert clip["text"] and (not clip["ok"] or isinstance(clip["data"]["text"], str))
+assert cmd("pointer", {"dx": 0, "dy": 0})["ok"]
+assert not cmd("key", {"key": "a"})["ok"] and not cmd("key", {"key": "nope"})["ok"]
+# The touchpad keeps one connection open for many requests.
+s = socket.create_connection(("127.0.0.1", L.PORT), timeout=5)
+for _ in range(3):
+    L.write_frame(s, {"t": "cmd", "device": device, "box": L.seal(key, {"action": "pointer", "args": {}, "ts": int(time.time() * 1000)}, b"cmd:" + device.encode())})
+    assert L.open_box(key, L.read_frame(s)["box"], b"reply:" + device.encode())[0]["ok"]
+s.close()
 print("ALL OK")
 server.shutdown()
