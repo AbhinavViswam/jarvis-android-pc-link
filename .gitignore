@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# JARVIS Link keeps its settings, pairings and log in %APPDATA%\JARVIS Link, never here.
+# These are in case a copy is ever made into this folder: phone keys and personal paths.
+paired.json
+config.json
+*.log
+*.tmp
