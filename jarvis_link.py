@@ -52,7 +52,7 @@ LOG_FILE = HOME / "link.log"
 STARTUP_FILE = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Startup/JARVIS Link.vbs"
 
 PAIR_WINDOW_S = 180           # a pairing QR code works for 3 minutes, once
-MAX_FRAME = 256 * 1024        # requests are tiny; anything bigger is refused
+MAX_FRAME = 1536 * 1024       # a file arrives in pieces of 384 KB; anything bigger is refused
 MAX_SKEW_S = 120              # a request older (or newer) than this is refused
 PROJECT_MARKERS = {".git", "package.json", "build.gradle", "build.gradle.kts", "settings.gradle.kts", "pyproject.toml",
                    "requirements.txt", "setup.py", "Cargo.toml", "go.mod", "pom.xml", "composer.json", "pubspec.yaml"}
@@ -78,6 +78,41 @@ def _save(path: Path, data) -> None:
     tmp.replace(path)
 
 
+KNOWN_FOLDERS = {
+    "Downloads": "{374DE290-123F-4565-9164-39C4925E467B}",
+    "Desktop": "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
+    "Documents": "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}",
+    "Pictures": "{33E28130-4E1E-4676-835A-98395C3BC3BB}",
+    "Screenshots": "{B7BEDE81-DF94-4682-A7D8-57A52620B86F}",
+}
+
+
+def known_folder(name: str) -> Path | None:
+    """Where Windows really keeps Downloads, Desktop, Pictures… — OneDrive moves some of them."""
+    guid = KNOWN_FOLDERS.get(name)
+    if guid:
+        try:
+            class GUID(ctypes.Structure):
+                _fields_ = [("a", ctypes.c_uint32), ("b", ctypes.c_uint16), ("c", ctypes.c_uint16), ("d", ctypes.c_ubyte * 8)]
+            g = GUID()
+            ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(guid), ctypes.byref(g))
+            out = ctypes.c_wchar_p()
+            if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(g), 0, None, ctypes.byref(out)) == 0:
+                path = Path(out.value)
+                ctypes.windll.ole32.CoTaskMemFree(out)
+                if path.is_dir():
+                    return path
+        except Exception:
+            pass
+    fallback = Path.home() / ("Pictures/Screenshots" if name == "Screenshots" else name)
+    return fallback if fallback.is_dir() else None
+
+
+def default_share_folders() -> dict[str, str]:
+    found = {n: known_folder(n) for n in KNOWN_FOLDERS}
+    return {n: str(v) for n, v in found.items() if v}
+
+
 def load_config() -> dict:
     c = _load(CONFIG_FILE, {})
     changed = False
@@ -89,6 +124,9 @@ def load_config() -> dict:
         home = Path.home()
         guesses = [home / "Documents", home / "Projects", home / "source" / "repos", home / "StudioProjects"]
         c["workspaces"] = {p.name: str(p) for p in guesses if p.is_dir()}
+        changed = True
+    if "share_folders" not in c:
+        c["share_folders"] = default_share_folders()
         changed = True
     c.setdefault("aliases", {})          # "jarvis": "C:\\...\\jarvis-android"
     c.setdefault("editor", "code")       # a command on PATH; the folder is passed to it. "explorer" opens the folder.
@@ -244,7 +282,8 @@ def handle_cmd(req: dict) -> dict:
     except Exception as e:  # an action failing must never take the link down
         log.exception("action %s failed", action)
         ok, text, data = False, f"That failed on the PC: {e.__class__.__name__}.", None
-    log.info("%s from %s: %s", action, entry.get("name", "?"), "ok" if ok else "failed")
+    if action not in ("file_chunk", "file_get_chunk"):
+        log.info("%s from %s: %s", action, entry.get("name", "?"), "ok" if ok else "failed")
     p = paired()
     if device in p:
         p[device]["last_seen"] = int(time.time())
@@ -501,6 +540,316 @@ def act_status(args):
     return True, ", ".join(parts) + ".", {"name": PC_NAME}
 
 
+# ---------------------------------------------------------------------------------------------- files from the phone
+
+RECEIVED_DIR = (known_folder("Downloads") or Path.home() / "Downloads") / "From phone"
+MAX_FILE = 500 * 1024 * 1024        # one file, at most
+UPLOAD_IDLE_S = 600                 # an upload with no piece for this long is dropped
+
+_uploads: dict[str, dict] = {}
+_uploads_lock = threading.Lock()
+on_received = lambda name, path: None  # the tray's "Received photo.jpg" note, set by the UI
+
+
+def _safe_name(name: str) -> str:
+    """Just a file name: no folders, nothing Windows forbids, not empty, not too long."""
+    base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", Path(str(name)).name).strip(" .")
+    if not base or base.upper().split(".")[0] in {"CON", "PRN", "AUX", "NUL", "COM1", "LPT1"}:
+        base = "file"
+    stem, dot, ext = base.rpartition(".")
+    if dot and len(ext) <= 10:
+        return stem[:120] + "." + ext
+    return base[:130]
+
+
+def _drop_stale_uploads():
+    now = time.time()
+    with _uploads_lock:
+        for uid, u in list(_uploads.items()):
+            if now - u["t"] > UPLOAD_IDLE_S:
+                try:
+                    Path(u["tmp"]).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                del _uploads[uid]
+
+
+def act_file_begin(args):
+    _drop_stale_uploads()
+    size = int(args.get("size", -1))
+    if size < 0 or size > MAX_FILE:
+        return False, f"Files up to {MAX_FILE // (1024 * 1024)} MB can be sent.", None
+    RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
+    uid = secrets.token_hex(8)
+    tmp = RECEIVED_DIR / f".incoming-{uid}.part"
+    tmp.write_bytes(b"")
+    with _uploads_lock:
+        _uploads[uid] = {"name": _safe_name(args.get("name", "file")), "size": size, "got": 0, "next": 0, "tmp": str(tmp), "t": time.time()}
+    return True, "Ready.", {"upload": uid}
+
+
+def act_file_chunk(args):
+    uid = str(args.get("upload", ""))
+    with _uploads_lock:
+        u = _uploads.get(uid)
+    if not u:
+        return False, "That transfer has expired. Send it again.", None
+    if int(args.get("index", -1)) != u["next"]:
+        return False, "A piece arrived out of order. Send it again.", None
+    data = base64.b64decode(args.get("data", ""))
+    if u["got"] + len(data) > u["size"]:
+        return False, "The file was bigger than announced.", None
+    with open(u["tmp"], "ab") as f:
+        f.write(data)
+    u["got"] += len(data)
+    u["next"] += 1
+    u["t"] = time.time()
+    return True, "ok", {"got": u["got"]}
+
+
+def act_file_end(args):
+    uid = str(args.get("upload", ""))
+    with _uploads_lock:
+        u = _uploads.pop(uid, None)
+    if not u:
+        return False, "That transfer has expired. Send it again.", None
+    if u["got"] != u["size"]:
+        Path(u["tmp"]).unlink(missing_ok=True)
+        return False, "The file didn't arrive whole. Send it again.", None
+    target = RECEIVED_DIR / u["name"]
+    stem, suffix, n = target.stem, target.suffix, 1
+    while target.exists():  # never overwrite: photo.jpg, photo (2).jpg, …
+        n += 1
+        target = RECEIVED_DIR / f"{stem} ({n}){suffix}"
+    Path(u["tmp"]).replace(target)
+    log.info("received a file (%d KB)", u["size"] // 1024)
+    try:
+        on_received(target.name, str(target))
+    except Exception:
+        log.exception("received-file note failed")
+    if args.get("open"):
+        os.startfile(target)
+        return True, f"Saved {target.name} to Downloads, From phone, and opened it.", {"path": str(target)}
+    return True, f"Saved {target.name} to Downloads, From phone.", {"path": str(target)}
+
+
+def act_open_received(args):
+    RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
+    os.startfile(RECEIVED_DIR)
+    return True, "Opened the From phone folder.", None
+
+
+# ---------------------------------------------------------------------------------------------- files to the phone
+
+KINDS = {
+    "pdf": {".pdf"},
+    "image": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"},
+    "screenshot": {".png", ".jpg", ".jpeg"},
+    "video": {".mp4", ".mkv", ".mov", ".avi", ".webm"},
+    "document": {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".csv", ".md", ".odt"},
+    "audio": {".mp3", ".wav", ".m4a", ".flac", ".ogg"},
+    "zip": {".zip", ".rar", ".7z"},
+}
+OFFER_TTL_S = 900                   # a file offered in a list can be fetched for 15 minutes
+_offers: dict[str, tuple[str, float]] = {}      # token → (path, when offered)
+_downloads: dict[str, dict] = {}                # token → {path, size, t}
+_offers_lock = threading.Lock()
+
+
+def share_folders() -> dict[str, str]:
+    """The folders the phone may take files from, by name (config.json "share_folders")."""
+    c = CONFIG.get("share_folders")
+    return default_share_folders() if c is None else c
+
+
+def _allowed(path: Path) -> bool:
+    """Inside one of the shared folders, a real file, not hidden."""
+    try:
+        real = path.resolve()
+    except OSError:
+        return False
+    if not real.is_file() or real.name.startswith(".") or real.suffix.lower() in {".part", ".tmp", ".crdownload", ".lnk", ".ini"}:
+        return False
+    for root in share_folders().values():
+        try:
+            real.relative_to(Path(root).resolve())
+            return True
+        except (ValueError, OSError):
+            continue
+    return False
+
+
+def _candidates(folder: str | None, kind: str | None, name: str | None) -> list[Path]:
+    """Files in the shared folders (or the one named) matching a kind and part of a name; newest first."""
+    roots = share_folders()
+    if folder:
+        pick, _ = best_match(folder, list(roots))
+        roots = {pick: roots[pick]} if pick else {}
+    exts = KINDS.get((kind or "").lower())
+    want = _norm(name or "")
+    found: list[tuple[float, Path]] = []
+    seen: set[str] = set()
+    for root in roots.values():
+        base = Path(root)
+        stack = [(base, 0)]
+        while stack and len(found) < 20_000:
+            d, depth = stack.pop()
+            try:
+                entries = list(os.scandir(d))
+            except OSError:
+                continue
+            for e in entries:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if depth < 2 and not e.name.startswith(".") and e.name not in SKIP_DIRS:
+                            stack.append((Path(e.path), depth + 1))
+                        continue
+                    if not e.is_file(follow_symlinks=False) or e.name.startswith("."):
+                        continue
+                    p = Path(e.path)
+                    suffix = p.suffix.lower()
+                    if suffix in {".part", ".tmp", ".crdownload", ".lnk", ".ini"}:
+                        continue
+                    if exts and suffix not in exts:
+                        continue
+                    if kind == "screenshot" and "screenshot" not in (p.name.lower() + str(p.parent).lower()):
+                        continue
+                    if want and want not in _norm(p.stem):
+                        continue
+                    key = str(p).lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    found.append((e.stat().st_mtime, p))
+                except OSError:
+                    continue
+    found.sort(key=lambda t: -t[0])
+    return [p for _, p in found]
+
+
+def _offer(p: Path) -> dict:
+    token = secrets.token_hex(8)
+    with _offers_lock:
+        now = time.time()
+        for k, (_, t) in list(_offers.items()):
+            if now - t > OFFER_TTL_S:
+                del _offers[k]
+        _offers[token] = (str(p), now)
+    st = p.stat()
+    # The most specific shared folder it's in: Screenshots rather than Pictures.
+    inside = [(len(str(Path(r))), n) for n, r in share_folders().items() if str(p).lower().startswith(str(Path(r)).lower())]
+    folder = max(inside)[1] if inside else p.parent.name
+    return {"id": token, "name": p.name, "folder": folder, "size": st.st_size, "modified": int(st.st_mtime * 1000)}
+
+
+def act_find_files(args):
+    files = _candidates(args.get("folder"), args.get("kind"), args.get("name"))[:10]
+    if not files:
+        where = ", ".join(share_folders()) or "no folders"
+        return False, f"No matching files in the shared folders ({where}).", []
+    offered = [_offer(p) for p in files]
+    lines = [f"{i + 1}. {f['name']} ({f['folder']}, {_size(f['size'])}, {time.strftime('%d %b %H:%M', time.localtime(f['modified'] / 1000))})"
+             for i, f in enumerate(offered)]
+    return True, "\n".join(lines), offered
+
+
+def _size(n: int) -> str:
+    return f"{n / 1_048_576:.1f} MB" if n >= 1_048_576 else f"{max(1, n // 1024)} KB"
+
+
+def act_file_get_begin(args):
+    """Starts sending a file the phone chose from a list (by its id), or the newest match for what it describes."""
+    token = str(args.get("id", ""))
+    with _offers_lock:
+        offered = _offers.get(token)
+    if offered:
+        path = Path(offered[0])
+    else:
+        found = _candidates(args.get("folder"), args.get("kind"), args.get("name"))
+        if not found:
+            return False, "No matching file in the shared folders.", None
+        path = found[0]
+    if not _allowed(path):
+        return False, "That file isn't in a folder the phone may take files from.", None
+    size = path.stat().st_size
+    if size > MAX_FILE:
+        return False, f"That file is {_size(size)}; files up to {MAX_FILE // 1_048_576} MB can be sent.", None
+    download = secrets.token_hex(8)
+    with _offers_lock:
+        now = time.time()
+        for k, d in list(_downloads.items()):
+            if now - d["t"] > UPLOAD_IDLE_S:
+                del _downloads[k]
+        _downloads[download] = {"path": str(path), "size": size, "t": now}
+    log.info("sending a file to the phone (%s)", _size(size))
+    return True, "Ready.", {"download": download, "name": path.name, "size": size}
+
+
+def act_file_get_chunk(args):
+    with _offers_lock:
+        d = _downloads.get(str(args.get("download", "")))
+    if not d:
+        return False, "That transfer has expired. Ask for the file again.", None
+    index = int(args.get("index", 0))
+    with open(d["path"], "rb") as f:
+        f.seek(index * CHUNK)
+        data = f.read(CHUNK)
+    d["t"] = time.time()
+    return True, "ok", {"data": base64.b64encode(data).decode(), "last": (index + 1) * CHUNK >= d["size"]}
+
+
+CHUNK = 384 * 1024
+
+
+# ---------------------------------------------------------------------------------------------- folders & the screen
+
+def act_open_folder(args):
+    """Opens a folder the PC already knows by name — a shared folder, a workspace, a project, From phone. Never a path."""
+    known: dict[str, str] = {}
+    known.update(share_folders())
+    known.update(workspaces())
+    known["From phone"] = str(RECEIVED_DIR)
+    for p in all_projects():
+        known.setdefault(p.full, p.path)
+        known.setdefault(p.name, p.path)
+    query = str(args.get("name", "")).strip()
+    name, options = best_match(query, list(known))
+    if name is None and options and len({known[o] for o in options}) == 1:
+        name = options[0]
+    if name is None:
+        return False, (f"Which one: {', '.join(options)}?" if options else f"I don't know a folder called {query}. I know: " + ", ".join(list(share_folders()) + list(workspaces()))), options
+    path = Path(known[name])
+    path.mkdir(parents=True, exist_ok=True) if name == "From phone" else None
+    if not path.is_dir():
+        return False, f"{name} isn't there any more.", None
+    os.startfile(path)
+    return True, f"Opened {name} on the PC.", {"name": name}
+
+
+SHOTS_DIR = HOME / "shots"
+
+
+def act_screenshot(args):
+    """A picture of the PC's screen (every monitor), sized for the phone, ready to fetch like a file."""
+    from PIL import ImageGrab
+    img = ImageGrab.grab(all_screens=True).convert("RGB")
+    edge = 1920
+    if max(img.size) > edge:
+        scale = edge / max(img.size)
+        img = img.resize((int(img.width * scale), int(img.height * scale)))
+    SHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    for old in sorted(SHOTS_DIR.glob("*.jpg"))[:-2]:  # keep only the last few
+        old.unlink(missing_ok=True)
+    path = SHOTS_DIR / time.strftime("Laptop screen %Y-%m-%d %H.%M.%S.jpg")
+    img.save(path, "JPEG", quality=80)
+    size = path.stat().st_size
+    download = secrets.token_hex(8)
+    with _offers_lock:
+        _downloads[download] = {"path": str(path), "size": size, "t": time.time()}
+    log.info("screenshot for the phone (%s)", _size(size))
+    return True, "Took a screenshot.", {"download": download, "name": path.name, "size": size}
+
+
 ACTIONS = {
     "status": act_status,
     "list_projects": act_list_projects,
@@ -511,6 +860,15 @@ ACTIONS = {
     "lock": act_lock,
     "sleep": act_sleep,
     "media": act_media,
+    "file_begin": act_file_begin,
+    "file_chunk": act_file_chunk,
+    "file_end": act_file_end,
+    "open_received": act_open_received,
+    "find_files": act_find_files,
+    "file_get_begin": act_file_get_begin,
+    "file_get_chunk": act_file_get_chunk,
+    "open_folder": act_open_folder,
+    "screenshot": act_screenshot,
 }
 
 
@@ -800,6 +1158,17 @@ def run_ui():
 
     PAIRING.on_paired = paired_done
 
+    def received(name, path):
+        def note():
+            try:
+                icon.notify(f"Received {name} from your phone (Downloads\\From phone).", APP)
+            except Exception:
+                log.exception("tray notice failed")
+        jobs.put(note)
+
+    global on_received
+    on_received = received
+
     def toggle_startup(icon_, item):
         start_with_windows(not STARTUP_FILE.exists())
 
@@ -812,7 +1181,8 @@ def run_ui():
         menu=pystray.Menu(
             pystray.MenuItem("Open JARVIS Link", lambda i, it: jobs.put(show_window), default=True),
             pystray.MenuItem("Pair a phone…", lambda i, it: jobs.put(lambda: show_window(pair_now=True))),
-            pystray.MenuItem("Project folders…", lambda i, it: os.startfile(CONFIG_FILE)),
+            pystray.MenuItem("Files from phone", lambda i, it: act_open_received({})),
+            pystray.MenuItem("Settings (folders)…", lambda i, it: os.startfile(CONFIG_FILE)),
             pystray.MenuItem("Start with Windows", toggle_startup, checked=lambda item: STARTUP_FILE.exists()),
             pystray.MenuItem("Open log", lambda i, it: os.startfile(LOG_FILE)),
             pystray.Menu.SEPARATOR,

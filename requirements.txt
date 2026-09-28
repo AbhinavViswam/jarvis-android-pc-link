@@ -1,5 +1,13 @@
-cryptography>=43
-zeroconf>=0.132
-pystray>=0.19
-Pillow>=10
-qrcode>=7.4
+# Exact versions JARVIS Link was tested with (Python 3.14). setup.bat installs these into .venv.
+# To upgrade: change a version here, run setup.bat, then python test_link.py.
+cryptography==49.0.0
+zeroconf==0.151.3
+pystray==0.19.5
+pillow==12.3.0
+qrcode==8.2
+# what those need
+cffi==2.1.1
+pycparser==3.0
+ifaddr==0.2.0
+six==1.17.0
+colorama==0.4.6

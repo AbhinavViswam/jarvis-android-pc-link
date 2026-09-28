@@ -47,5 +47,40 @@ assert "box" in call({"t": "cmd", "device": device, "box": box})
 replayed = L.open_box(key, call({"t": "cmd", "device": device, "box": box})["box"], b"reply:" + device.encode())[0]
 assert not replayed["ok"], replayed
 print("best_match:", L.best_match("jarvis android", ["jarvis-android", "Mark-LIV", "Mark-LIII"]), L.best_match("mark", ["Mark-LIV", "Mark-LIII"]))
+# A file in pieces, as the phone sends it; saved under a safe name, never over another.
+from pathlib import Path
+L.RECEIVED_DIR = Path(os.environ["APPDATA"]) / "From phone"
+blob = secrets.token_bytes(900_000)
+for attempt in range(2):
+    up = cmd("file_begin", {"name": r"..\evil/photo.jpg", "size": len(blob)})["data"]["upload"]
+    for i in range(0, len(blob), 384 * 1024):
+        r = cmd("file_chunk", {"upload": up, "index": i // (384 * 1024), "data": base64.b64encode(blob[i:i + 384 * 1024]).decode()})
+        assert r["ok"], r
+    end = cmd("file_end", {"upload": up})
+    assert end["ok"], end
+print(sorted(p.name for p in L.RECEIVED_DIR.iterdir()))
+assert (L.RECEIVED_DIR / "photo.jpg").read_bytes() == blob and (L.RECEIVED_DIR / "photo (2).jpg").exists()
+assert not cmd("file_begin", {"name": "x", "size": 10**10})["ok"]
+# Back to the phone: only from the shared folders, chosen from the list the PC gave.
+L.CONFIG["share_folders"] = {"From phone": str(L.RECEIVED_DIR)}
+listed = cmd("find_files", {"kind": "image"})
+assert listed["ok"] and listed["data"][0]["name"].startswith("photo"), listed
+got = cmd("file_get_begin", {"id": listed["data"][0]["id"]})["data"]
+back, i = b"", 0
+while True:
+    piece = cmd("file_get_chunk", {"download": got["download"], "index": i})["data"]
+    back += base64.b64decode(piece["data"])
+    i += 1
+    if piece["last"]:
+        break
+assert back == blob and got["size"] == len(blob)
+assert not cmd("file_get_begin", {"id": "made-up", "name": "../../Windows/win.ini"})["ok"]
+assert not L._allowed(Path(os.environ["WINDIR"]) / "win.ini")
+# The screen, fetched like a file.
+shot = cmd("screenshot")
+assert shot["ok"], shot
+first = cmd("file_get_chunk", {"download": shot["data"]["download"], "index": 0})["data"]
+assert base64.b64decode(first["data"])[:2] == b"\xff\xd8"  # a JPEG
+assert not cmd("open_folder", {"name": "C:/Windows/System32"})["ok"]
 print("ALL OK")
 server.shutdown()
