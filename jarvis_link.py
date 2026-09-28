@@ -580,6 +580,17 @@ def act_status(args):
     parts = [f"{PC_NAME} is on"]
     if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(s)) and s.BatteryFlag != -128 and 0 <= s.BatteryLifePercent <= 100:
         parts.append(f"battery {s.BatteryLifePercent}%" + (", charging" if s.ACLineStatus == 1 else ""))
+    # Memory and the system drive's space too (both instant), so "how's my laptop?" gets the numbers either way.
+    try:
+        m = _MemStatus()
+        m.dwLength = ctypes.sizeof(m)
+        if _k32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            parts.append(f"memory {_gb(m.ullTotalPhys - m.ullAvailPhys)} of {_gb(m.ullTotalPhys)} in use")
+        system = os.environ.get("SystemDrive", "C:")
+        u = shutil.disk_usage(system + "\\")
+        parts.append(f"{system} {_gb(u.free)} free of {_gb(u.total)}")
+    except Exception:
+        pass
     return True, ", ".join(parts) + ".", {"name": PC_NAME}
 
 
