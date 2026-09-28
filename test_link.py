@@ -82,5 +82,15 @@ assert shot["ok"], shot
 first = cmd("file_get_chunk", {"download": shot["data"]["download"], "index": 0})["data"]
 assert base64.b64decode(first["data"])[:2] == b"\xff\xd8"  # a JPEG
 assert not cmd("open_folder", {"name": "C:/Windows/System32"})["ok"]
+# How the PC is doing: read-only, and every answer is words the phone can say.
+for action in ("usage", "disk", "open_apps", "downloads"):
+    r = cmd(action)
+    assert r["ok"] and r["text"], (action, r)
+assert "CPU" in cmd("usage")["text"] and "free of" in cmd("disk")["text"]
+# Control, the harmless parts only: nothing is changed, shut down or typed.
+assert cmd("volume")["ok"] and "volume" in cmd("volume")["text"]
+assert cmd("brightness")["text"]  # a desktop PC says it can't; a laptop says the level
+assert "Nothing was going to" in cmd("cancel_shutdown")["text"]
+assert not cmd("type")["ok"]
 print("ALL OK")
 server.shutdown()

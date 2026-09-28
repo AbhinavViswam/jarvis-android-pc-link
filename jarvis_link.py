@@ -540,6 +540,555 @@ def act_status(args):
     return True, ", ".join(parts) + ".", {"name": PC_NAME}
 
 
+# ---------------------------------------------------------------------------------------------- how the PC is doing
+# Read-only: how busy it is, disk space, which apps are open (names only, never window titles), and downloads.
+# Windows' own functions through ctypes, so no extra packages.
+
+from ctypes import wintypes
+
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_u32 = ctypes.WinDLL("user32", use_last_error=True)
+_k32.OpenProcess.restype = wintypes.HANDLE
+_k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_k32.CloseHandle.argtypes = [wintypes.HANDLE]
+_k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+_k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+_k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+_k32.K32EnumProcesses.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+_u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+_u32.GetWindow.restype = wintypes.HWND
+_u32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+_u32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+_u32.IsWindowVisible.argtypes = [wintypes.HWND]
+_u32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+_u32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+_u32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
+_u32.EnumChildWindows.argtypes = [wintypes.HWND, _WNDENUMPROC, wintypes.LPARAM]
+
+_QUERY_LIMITED = 0x1000
+
+
+class _MemStatus(ctypes.Structure):
+    _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD), ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+class _ProcMem(ctypes.Structure):
+    _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD), ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t), ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t), ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t), ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t)]
+
+
+def _ft(f: wintypes.FILETIME) -> int:
+    return (f.dwHighDateTime << 32) | f.dwLowDateTime
+
+
+def _gb(n: float) -> str:
+    g = n / 1024 ** 3
+    return f"{g:.1f} GB" if g < 10 else f"{g:.0f} GB"
+
+
+def _pids() -> list[int]:
+    arr = (wintypes.DWORD * 4096)()
+    got = wintypes.DWORD()
+    if not _k32.K32EnumProcesses(arr, ctypes.sizeof(arr), ctypes.byref(got)):
+        return []
+    return [p for p in arr[: got.value // ctypes.sizeof(wintypes.DWORD)] if p]
+
+
+def _exe(handle) -> str | None:
+    buf = ctypes.create_unicode_buffer(1024)
+    n = wintypes.DWORD(len(buf))
+    return buf.value if _k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(n)) else None
+
+
+def _exe_of(pid: int) -> str | None:
+    h = _k32.OpenProcess(_QUERY_LIMITED, False, pid)
+    if not h:
+        return None
+    try:
+        return _exe(h)
+    finally:
+        _k32.CloseHandle(h)
+
+
+_app_names: dict[str, str] = {}
+_NAME_FIXES = {"Windows Explorer": "File Explorer", "Code": "VS Code", "Visual Studio Code": "VS Code",
+               "OpenJDK Platform binary": "Java", "Java(TM) Platform SE binary": "Java"}
+
+
+def app_name(exe: str) -> str:
+    """What people call a program: its own description ("Google Chrome"), else its file name ("chrome")."""
+    if exe in _app_names:
+        return _app_names[exe]
+    name = Path(exe).stem
+    try:
+        ver = ctypes.WinDLL("version")
+        size = ver.GetFileVersionInfoSizeW(exe, None)
+        if size:
+            data = ctypes.create_string_buffer(size)
+            if ver.GetFileVersionInfoW(exe, 0, size, data):
+                ptr, n = ctypes.c_void_p(), wintypes.UINT()
+                if ver.VerQueryValueW(data, "\\VarFileInfo\\Translation", ctypes.byref(ptr), ctypes.byref(n)) and n.value >= 4:
+                    lang, cp = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ushort * 2)).contents
+                    key = f"\\StringFileInfo\\{lang:04x}{cp:04x}\\FileDescription"
+                    if ver.VerQueryValueW(data, key, ctypes.byref(ptr), ctypes.byref(n)) and n.value > 1:
+                        desc = ctypes.wstring_at(ptr, n.value - 1).strip()
+                        if 1 < len(desc) <= 40:
+                            name = desc
+    except Exception:
+        pass
+    name = _NAME_FIXES.get(name, name)
+    _app_names[exe] = name
+    return name
+
+
+def _processes() -> dict[int, tuple[str, int, int]]:
+    """Every process this user can see: pid → (program, CPU time so far, memory in use)."""
+    out = {}
+    for pid in _pids():
+        h = _k32.OpenProcess(_QUERY_LIMITED, False, pid)
+        if not h:
+            continue
+        try:
+            exe = _exe(h)
+            if not exe:
+                continue
+            c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+            cpu = _ft(k) + _ft(u) if _k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e), ctypes.byref(k), ctypes.byref(u)) else 0
+            mem = _ProcMem()
+            mem.cb = ctypes.sizeof(mem)
+            ram = mem.WorkingSetSize if _k32.K32GetProcessMemoryInfo(h, ctypes.byref(mem), mem.cb) else 0
+            out[pid] = (exe, cpu, ram)
+        finally:
+            _k32.CloseHandle(h)
+    return out
+
+
+_SKIP_PROGRAMS = {"system", "registry", "memory compression", "idle", "secure system"}
+
+
+def act_usage(args):
+    """How busy the PC is: CPU and memory, and which programs use the most of each (a one-second look)."""
+    idle0, kern0, user0 = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+    _k32.GetSystemTimes(ctypes.byref(idle0), ctypes.byref(kern0), ctypes.byref(user0))
+    before, t0 = _processes(), time.perf_counter()
+    time.sleep(1.0)
+    idle1, kern1, user1 = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+    _k32.GetSystemTimes(ctypes.byref(idle1), ctypes.byref(kern1), ctypes.byref(user1))
+    after, t1 = _processes(), time.perf_counter()
+
+    busy_all = (_ft(kern1) - _ft(kern0)) + (_ft(user1) - _ft(user0))
+    cpu = max(0.0, min(100.0, 100.0 * (1 - (_ft(idle1) - _ft(idle0)) / busy_all))) if busy_all else 0.0
+    m = _MemStatus()
+    m.dwLength = ctypes.sizeof(m)
+    _k32.GlobalMemoryStatusEx(ctypes.byref(m))
+    used = m.ullTotalPhys - m.ullAvailPhys
+
+    cores = os.cpu_count() or 1
+    by_cpu: dict[str, float] = {}
+    by_ram: dict[str, int] = {}
+    for pid, (exe, t, ram) in after.items():
+        name = app_name(exe)
+        if name.lower() in _SKIP_PROGRAMS or Path(exe).name.lower() == "pythonw.exe" and pid == os.getpid():
+            continue
+        if pid in before and before[pid][0] == exe:
+            by_cpu[name] = by_cpu.get(name, 0.0) + (t - before[pid][1]) / 1e7 / (t1 - t0) / cores * 100
+        by_ram[name] = by_ram.get(name, 0) + ram
+    top_cpu = sorted(((v, k) for k, v in by_cpu.items() if v >= 1), reverse=True)[:3]
+    top_ram = sorted(((v, k) for k, v in by_ram.items()), reverse=True)[:3]
+
+    parts = [f"CPU {cpu:.0f}%", f"memory {_gb(used)} of {_gb(m.ullTotalPhys)} in use ({m.dwMemoryLoad}%)"]
+    text = f"{PC_NAME}: " + ", ".join(parts) + "."
+    if top_cpu:
+        text += " Busiest: " + ", ".join(f"{n} {v:.0f}%" for v, n in top_cpu) + "."
+    else:
+        text += " Nothing is working hard."
+    if top_ram:
+        text += " Most memory: " + ", ".join(f"{n} {_gb(v)}" for v, n in top_ram) + "."
+    return True, text, {
+        "cpu": round(cpu), "ram_used": used, "ram_total": m.ullTotalPhys,
+        "top_cpu": [{"name": n, "percent": round(v)} for v, n in top_cpu],
+        "top_ram": [{"name": n, "bytes": v} for v, n in top_ram],
+    }
+
+
+def act_disk(args):
+    """Free space on each of the PC's own drives (not USB sticks or network drives)."""
+    drives = []
+    mask = _k32.GetLogicalDrives()
+    for i in range(26):
+        if not mask & (1 << i):
+            continue
+        root = f"{chr(65 + i)}:\\"
+        if _k32.GetDriveTypeW(root) != 3:  # DRIVE_FIXED
+            continue
+        try:
+            u = shutil.disk_usage(root)
+        except OSError:
+            continue
+        drives.append({"drive": root[:2], "free": u.free, "total": u.total})
+    if not drives:
+        return False, "I couldn't read the PC's drives.", None
+    lines = [f"{d['drive']} {_gb(d['free'])} free of {_gb(d['total'])}" for d in drives]
+    low = [d["drive"] for d in drives if d["free"] < 0.1 * d["total"]]
+    text = f"{PC_NAME}: " + "; ".join(lines) + "."
+    if low:
+        text += " " + " and ".join(low) + (" is" if len(low) == 1 else " are") + " nearly full."
+    return True, text, {"drives": drives}
+
+
+_SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+
+
+def open_apps() -> dict[str, int]:
+    """The programs with a window open on the desktop (minimised ones too), and how many windows each: names only."""
+    dwm = ctypes.WinDLL("dwmapi")
+    found: dict[str, int] = {}
+    me = os.getpid()
+
+    def pid_of(hwnd) -> int:
+        pid = wintypes.DWORD()
+        _u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value
+
+    def on_window(hwnd, _):
+        try:
+            if not _u32.IsWindowVisible(hwnd) or _u32.GetWindow(hwnd, 4) or not _u32.GetWindowTextLengthW(hwnd):
+                return True  # hidden, owned by another window (a dialog), or untitled
+            if _u32.GetWindowLongW(hwnd, -20) & 0x80:  # WS_EX_TOOLWINDOW
+                return True
+            cloaked = wintypes.DWORD()
+            if dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4) == 0 and cloaked.value:
+                return True  # a Store app that isn't really showing
+            cls = ctypes.create_unicode_buffer(64)
+            _u32.GetClassNameW(hwnd, cls, 64)
+            if cls.value in _SHELL_CLASSES:
+                return True
+            pid = pid_of(hwnd)
+            if pid == me:
+                return True
+            exe = _exe_of(pid)
+            if exe and Path(exe).name.lower() == "applicationframehost.exe":
+                # A Store app's frame: the app itself is the child window from another process.
+                inner = []
+
+                def on_child(child, _):
+                    cp = pid_of(child)
+                    if cp != pid:
+                        inner.append(cp)
+                        return False
+                    return True
+
+                _u32.EnumChildWindows(hwnd, _WNDENUMPROC(on_child), 0)
+                exe = _exe_of(inner[0]) if inner else None
+            if exe:
+                name = app_name(exe)
+                found[name] = found.get(name, 0) + 1
+        except Exception:
+            pass
+        return True
+
+    _u32.EnumWindows(_WNDENUMPROC(on_window), 0)
+    return found
+
+
+def act_open_apps(args):
+    apps = open_apps()
+    if not apps:
+        return True, f"No apps are open on {PC_NAME}.", {"apps": []}
+    names = sorted(apps, key=str.lower)
+    said = [f"{n} ({apps[n]} windows)" if apps[n] > 1 else n for n in names]
+    return True, f"Open on {PC_NAME}: " + ", ".join(said) + ".", {"apps": [{"name": n, "windows": apps[n]} for n in names]}
+
+
+# Browsers' unfinished downloads: Chrome/Edge .crdownload, Firefox .part, old Edge .partial, Opera .opdownload.
+_PARTIAL = {".crdownload", ".part", ".partial", ".opdownload", ".download"}
+
+
+def act_downloads(args):
+    """What's still downloading in Downloads (and whether it's moving), and what finished lately."""
+    folder = known_folder("Downloads") or Path.home() / "Downloads"
+    if not folder.is_dir():
+        return False, "I can't find the Downloads folder.", None
+    partial, done = [], []
+    for f in folder.iterdir():
+        try:
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            st = f.stat()
+        except OSError:
+            continue
+        if f.suffix.lower() in _PARTIAL:
+            partial.append((f, st.st_size))
+        elif time.time() - st.st_mtime < 3 * 3600 and st.st_size > 0:
+            done.append((st.st_mtime, f.name, st.st_size))
+    growing = set()
+    if partial:
+        time.sleep(1.5)
+        for f, size in partial:
+            try:
+                if f.stat().st_size != size:
+                    growing.add(f)
+            except OSError:
+                growing.add(f)  # gone: it just finished
+    parts, data = [], {"downloading": [], "finished": []}
+    for f, size in partial[:5]:
+        real = f.stem
+        if real.lower().startswith("unconfirmed "):
+            real = "a file"
+        state = "downloading" if f in growing else "not moving (paused or stuck)"
+        parts.append(f"{real}: {state}, {_size(size)} so far")
+        data["downloading"].append({"name": real, "bytes": size, "moving": f in growing})
+    done.sort(reverse=True)
+    if partial:
+        text = "Still downloading on the PC: " + "; ".join(parts) + "."
+    else:
+        text = "Nothing is downloading on the PC."
+    if done:
+        at, name, size = done[0]
+        text += f" Latest finished: {name} ({_size(size)}) at {time.strftime('%H:%M', time.localtime(at))}."
+        data["finished"] = [{"name": n, "bytes": b, "at": int(t * 1000)} for t, n, b in done[:5]]
+    elif not partial:
+        text += " Nothing finished in the last 3 hours."
+    return True, text, data
+
+
+# ---------------------------------------------------------------------------------------------- control
+# Volume and brightness to a level, screen off, shutdown / restart (with time to cancel), and typing words.
+# The phone asks the user before shutdown, restart, and typing that presses Enter.
+
+on_notice = lambda text: None  # a tray notice on the PC, set by the UI
+
+
+def _level(args) -> int | None:
+    try:
+        return max(0, min(100, int(round(float(str(args.get("level", "")).strip().rstrip("%"))))))
+    except ValueError:
+        return None
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("a", wintypes.DWORD), ("b", wintypes.WORD), ("c", wintypes.WORD), ("d", ctypes.c_ubyte * 8)]
+
+    def __init__(self, text: str):
+        super().__init__()
+        ctypes.oledll.ole32.CLSIDFromString(text, ctypes.byref(self))
+
+
+def _com(obj, index: int, *types):
+    """Method [index] of a COM object's table, callable with the object first."""
+    table = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    return ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, *types)(table[index])
+
+
+def _release(obj):
+    if obj:
+        ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents[2])(obj)
+
+
+def _speakers(use):
+    """Runs use(volume) with the default speakers' IAudioEndpointVolume (Windows Core Audio, no packages)."""
+    ole = ctypes.oledll.ole32
+    started = ctypes.windll.ole32.CoInitializeEx(None, 0) in (0, 1)  # S_OK / S_FALSE: this thread is ours to close
+    enum = dev = vol = None
+    try:
+        enum = ctypes.c_void_p()
+        ole.CoCreateInstance(ctypes.byref(_GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}")), None, 1,
+                             ctypes.byref(_GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")), ctypes.byref(enum))
+        dev = ctypes.c_void_p()
+        _com(enum, 4, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))(enum, 0, 1, ctypes.byref(dev))  # render, multimedia
+        vol = ctypes.c_void_p()
+        iid = _GUID("{5CDF2C82-841E-4546-9722-0CF74078229A}")  # IAudioEndpointVolume
+        _com(dev, 3, ctypes.POINTER(_GUID), wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))(
+            dev, ctypes.byref(iid), 23, None, ctypes.byref(vol))
+        return use(vol)
+    finally:
+        for o in (vol, dev, enum):
+            _release(o)
+        if started:
+            ctypes.windll.ole32.CoUninitialize()
+
+
+def _get_volume(vol) -> tuple[int, bool]:
+    level, muted = ctypes.c_float(), wintypes.BOOL()
+    _com(vol, 9, ctypes.POINTER(ctypes.c_float))(vol, ctypes.byref(level))
+    _com(vol, 15, ctypes.POINTER(wintypes.BOOL))(vol, ctypes.byref(muted))
+    return round(level.value * 100), bool(muted.value)
+
+
+def act_volume(args):
+    """The PC's volume: set to a level (0–100), mute or unmute, or just say what it is."""
+    level = _level(args)
+    mute = str(args.get("mute", "")).lower()
+
+    def use(vol):
+        if level is not None:
+            _com(vol, 7, ctypes.c_float, ctypes.c_void_p)(vol, level / 100, None)
+            _com(vol, 14, wintypes.BOOL, ctypes.c_void_p)(vol, False, None)
+        if mute in ("true", "false"):
+            _com(vol, 14, wintypes.BOOL, ctypes.c_void_p)(vol, mute == "true", None)
+        return _get_volume(vol)
+
+    try:
+        now, muted = _speakers(use)
+    except OSError:
+        return False, "This PC has no speakers I can reach.", None
+    if muted:
+        return True, f"{PC_NAME}'s sound is muted (volume {now}%).", {"level": now, "muted": True}
+    return True, f"{PC_NAME}'s volume is {now}%.", {"level": now, "muted": False}
+
+
+def _powershell(script: str, timeout: float = 15) -> subprocess.CompletedProcess:
+    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=timeout, creationflags=0x08000000)
+
+
+def act_brightness(args):
+    """The built-in screen's brightness (a laptop's own panel; separate monitors have their own buttons)."""
+    level = _level(args)
+    if level is not None:
+        r = _powershell("Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop | "
+                        f"Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{{Timeout=1; Brightness={level}}} | Out-Null")
+        if r.returncode != 0:
+            return False, "This PC's screen brightness can't be set from here (it only works on a laptop's own screen).", None
+    r = _powershell("(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop | Select-Object -First 1).CurrentBrightness")
+    now = r.stdout.strip()
+    if r.returncode != 0 or not now.isdigit():
+        return False, "This PC's screen brightness can't be read from here (it only works on a laptop's own screen).", None
+    return True, f"{PC_NAME}'s screen brightness is {now}%.", {"level": int(now)}
+
+
+def act_screen_off(args):
+    """Turns the display off (not sleep, not lock); moving the mouse or a key brings it back."""
+    threading.Timer(1.0, lambda: ctypes.windll.user32.PostMessageW(0xFFFF, 0x0112, 0xF170, 2)).start()
+    return True, "Turning the PC's screen off.", None
+
+
+SHUTDOWN_DELAY_S = 30
+_power_timer: threading.Timer | None = None
+_power_what = ""
+_power_lock = threading.Lock()
+
+
+def _power_go(flag: str):
+    global _power_timer
+    with _power_lock:
+        _power_timer = None
+    log.info("%s now, as asked from the phone", "restarting" if flag == "/r" else "shutting down")
+    # No /f and no delay in shutdown itself (a delay implies /f): apps with unsaved work still get to ask.
+    subprocess.run(["shutdown", flag, "/t", "0"], creationflags=0x08000000)
+
+
+def _power(flag: str, what: str):
+    global _power_timer, _power_what
+    with _power_lock:
+        if _power_timer:
+            _power_timer.cancel()
+        _power_timer = threading.Timer(SHUTDOWN_DELAY_S, _power_go, (flag,))
+        _power_timer.daemon = True
+        _power_what = what
+        _power_timer.start()
+    try:
+        on_notice(f"{what} in {SHUTDOWN_DELAY_S} seconds, asked from your phone. Tray icon → Cancel {what.lower()} to stop it.")
+    except Exception:
+        log.exception("tray notice failed")
+    return True, f"{PC_NAME} will {what.lower()} in {SHUTDOWN_DELAY_S} seconds. Say cancel to stop it.", {"seconds": SHUTDOWN_DELAY_S}
+
+
+def act_shutdown(args):
+    return _power("/s", "Shut down")
+
+
+def act_restart(args):
+    return _power("/r", "Restart")
+
+
+def power_pending() -> str | None:
+    with _power_lock:
+        return _power_what if _power_timer else None
+
+
+def act_cancel_shutdown(args):
+    global _power_timer
+    with _power_lock:
+        t, what = _power_timer, _power_what
+        _power_timer = None
+    if not t:
+        return True, f"Nothing was going to shut down or restart {PC_NAME}.", None
+    t.cancel()
+    try:
+        on_notice(f"{what} cancelled.")
+    except Exception:
+        log.exception("tray notice failed")
+    return True, f"Cancelled: {PC_NAME} won't {what.lower()}.", None
+
+
+class _KeyInput(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _Input(ctypes.Structure):
+    class _U(ctypes.Union):
+        # The union is as big as its largest member (MOUSEINPUT); padding keeps SendInput's size check happy.
+        _fields_ = [("ki", _KeyInput), ("pad", ctypes.c_byte * 32)]
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+
+# Where typing words could run them: a terminal. Refused.
+_TERMINAL_CLASSES = {"ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "mintty", "PuTTY", "VirtualConsoleClass"}
+MAX_TYPE = 2000
+
+
+def _keys(events: list[tuple[int, int, int]]):
+    arr = (_Input * len(events))()
+    for i, (vk, scan, flags) in enumerate(events):
+        arr[i].type = 1  # INPUT_KEYBOARD
+        arr[i].ki = _KeyInput(vk, scan, flags, 0, 0)
+    ctypes.windll.user32.SendInput(len(events), arr, ctypes.sizeof(_Input))
+
+
+def act_type(args):
+    """Types words into whatever has the keyboard on the PC; Enter at the end only if asked. Never into a terminal."""
+    text = str(args.get("text", ""))[:MAX_TYPE]
+    enter = str(args.get("enter", "")).lower() == "true"
+    if not text and not enter:
+        return False, "What should I type?", None
+    _u32.GetForegroundWindow.restype = wintypes.HWND
+    fg = _u32.GetForegroundWindow()
+    if not fg:
+        return False, f"{PC_NAME} is locked or nothing is open to type into.", None
+    cls = ctypes.create_unicode_buffer(64)
+    _u32.GetClassNameW(fg, cls, 64)
+    pid = wintypes.DWORD()
+    _u32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+    exe = _exe_of(pid.value) or ""
+    if cls.value in _TERMINAL_CLASSES or Path(exe).name.lower() in {"windowsterminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "conhost.exe"}:
+        return False, "A terminal is in front on the PC; I won't type into one.", None
+    app = app_name(exe) if exe else "the window in front"
+    events = []
+    for ch in text.replace("\r\n", "\n").replace("\r", "\n"):
+        if ch == "\n":
+            events += [(0x0D, 0, 0), (0x0D, 0, 2)]  # Enter
+            continue
+        for unit in struct.unpack(f"<{len(ch.encode('utf-16-le')) // 2}H", ch.encode("utf-16-le")):
+            events += [(0, unit, 4), (0, unit, 4 | 2)]  # KEYEVENTF_UNICODE, down and up
+    if enter:
+        events += [(0x0D, 0, 0), (0x0D, 0, 2)]
+    for i in range(0, len(events), 200):
+        _keys(events[i:i + 200])
+        time.sleep(0.01)
+    said = f"Typed {len(text)} characters into {app}" if text else f"Pressed Enter in {app}"
+    return True, said + (" and pressed Enter." if enter and text else "."), {"app": app}
+
+
 # ---------------------------------------------------------------------------------------------- files from the phone
 
 RECEIVED_DIR = (known_folder("Downloads") or Path.home() / "Downloads") / "From phone"
@@ -869,6 +1418,17 @@ ACTIONS = {
     "file_get_chunk": act_file_get_chunk,
     "open_folder": act_open_folder,
     "screenshot": act_screenshot,
+    "usage": act_usage,
+    "disk": act_disk,
+    "open_apps": act_open_apps,
+    "downloads": act_downloads,
+    "volume": act_volume,
+    "brightness": act_brightness,
+    "screen_off": act_screen_off,
+    "shutdown": act_shutdown,
+    "restart": act_restart,
+    "cancel_shutdown": act_cancel_shutdown,
+    "type": act_type,
 }
 
 
@@ -1003,11 +1563,14 @@ def run_ui():
     ui: dict = {"win": None}
 
     def icon_image():
-        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.ellipse((4, 4, 60, 60), outline=(64, 200, 255, 255), width=6)
-        d.ellipse((22, 22, 42, 42), fill=(64, 200, 255, 255))
-        return img
+        """JARVIS's robot with LINK on its screen (icon.png, next to this file); a plain ring if it's missing."""
+        try:
+            return Image.open(Path(__file__).with_name("icon.png")).convert("RGBA")
+        except OSError:
+            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.ellipse((4, 4, 60, 60), outline=(255, 178, 36, 255), width=6)
+            return img
 
     def ago(ts: int) -> str:
         s = int(time.time()) - int(ts or 0)
@@ -1169,6 +1732,17 @@ def run_ui():
     global on_received
     on_received = received
 
+    def notice(text):
+        def note():
+            try:
+                icon.notify(text, APP)
+            except Exception:
+                log.exception("tray notice failed")
+        jobs.put(note)
+
+    global on_notice
+    on_notice = lambda text: (notice(text), jobs.put(icon.update_menu))
+
     def toggle_startup(icon_, item):
         start_with_windows(not STARTUP_FILE.exists())
 
@@ -1183,6 +1757,8 @@ def run_ui():
             pystray.MenuItem("Pair a phone…", lambda i, it: jobs.put(lambda: show_window(pair_now=True))),
             pystray.MenuItem("Files from phone", lambda i, it: act_open_received({})),
             pystray.MenuItem("Settings (folders)…", lambda i, it: os.startfile(CONFIG_FILE)),
+            pystray.MenuItem(lambda item: f"Cancel {(power_pending() or 'shutdown').lower()}",
+                             lambda i, it: act_cancel_shutdown({}), visible=lambda item: power_pending() is not None),
             pystray.MenuItem("Start with Windows", toggle_startup, checked=lambda item: STARTUP_FILE.exists()),
             pystray.MenuItem("Open log", lambda i, it: os.startfile(LOG_FILE)),
             pystray.Menu.SEPARATOR,

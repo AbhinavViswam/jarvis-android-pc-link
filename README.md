@@ -7,6 +7,12 @@ Lets JARVIS on your phone do a few things on this PC over your home Wi-Fi — in
 Share → **Send to laptop** from any app sends photos and files to `Downloads\From phone`.
 "Get me the latest screenshot from my laptop", "send me that PDF from Downloads" bring files the other way, into the phone's Downloads/JARVIS — only from the folders in `share_folders`.
 "Open Downloads on the laptop", "open the RateUp folder" (folders it knows by name), and "what's on my laptop screen?" (a screenshot JARVIS looks at).
+"Is my laptop busy?" (CPU, memory, the busiest apps), "how much space is left on the laptop?", "what's open on my laptop?"
+(app names only, never window titles), "has my download finished?" (unfinished browser downloads in Downloads, and whether they're moving).
+"Set the laptop volume to 30", "mute the laptop", "brightness to 50" (a laptop's own screen), "turn the laptop screen off",
+"shut down / restart my laptop" (the phone asks first; it happens after 30 seconds, and "cancel" or tray → Cancel stops it;
+apps with unsaved work still get to ask), "type this on my laptop" (into the window in front; never into a terminal; the phone
+asks first if it would press Enter).
 
 ## Setup
 1. Double-click **setup.bat**: it makes `.venv` here and installs the exact versions in `requirements.txt` (needs Python 3
