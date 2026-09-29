@@ -1046,7 +1046,8 @@ def act_volume(args):
         return False, "This PC has no speakers I can reach.", None
     if muted:
         return True, f"{PC_NAME}'s sound is muted (volume {now}%).", {"level": now, "muted": True}
-    return True, f"{PC_NAME}'s volume is {now}%.", {"level": now, "muted": False}
+    # "is now" only when it was changed: a reply that just reads it out must not sound like it was set.
+    return True, f"{PC_NAME}'s volume is {'now ' if level is not None else ''}{now}%.", {"level": now, "muted": False}
 
 
 def _powershell(script: str, timeout: float = 15) -> subprocess.CompletedProcess:
