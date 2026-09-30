@@ -105,5 +105,68 @@ for _ in range(3):
     L.write_frame(s, {"t": "cmd", "device": device, "box": L.seal(key, {"action": "pointer", "args": {}, "ts": int(time.time() * 1000)}, b"cmd:" + device.encode())})
     assert L.open_box(key, L.read_frame(s)["box"], b"reply:" + device.encode())[0]["ok"]
 s.close()
+# AI agents: agent_hook.py, run the way Claude Code / Antigravity / Codex run it, reaches the phone's long wait.
+import subprocess
+hook_env = dict(os.environ, JARVIS_LINK_PORT=str(L.PORT))
+hook = [sys.executable, "-S", os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_hook.py")]
+
+
+def fire(args, stdin=""):
+    r = subprocess.run(hook + args, input=stdin, capture_output=True, text=True, env=hook_env, timeout=10)
+    assert r.returncode == 0, r
+    return r.stdout
+
+
+start = cmd("agents_wait", {"since": -1})["data"]["v"]
+waited = {}
+waiter = threading.Thread(target=lambda: waited.update(cmd("agents_wait", {"since": start})))
+waiter.start()
+time.sleep(0.3)
+t0 = time.time()
+fire(["claude"], json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": r"C:\code\jarvis-android", "prompt": "secret words"}))
+waiter.join(10)
+assert time.time() - t0 < 5 and waited["data"]["sessions"][0]["state"] == "working", waited
+fire(["claude"], json.dumps({"hook_event_name": "Notification", "session_id": "s1", "cwd": r"C:\code\jarvis-android", "notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash"}))
+now = cmd("agents")
+assert "Claude Code in jarvis-android is waiting for your approval" in now["text"], now
+assert "secret" not in json.dumps(now) and "Bash" not in json.dumps(now)
+fire(["claude"], json.dumps({"hook_event_name": "Notification", "session_id": "s1", "notification_type": "idle_prompt"}))
+assert cmd("agents")["data"]["sessions"][0]["state"] == "approval"  # an idle reminder changes nothing
+fire(["claude"], json.dumps({"hook_event_name": "Stop", "session_id": "s1", "cwd": r"C:\code\jarvis-android"}))
+assert "finished" in cmd("agents")["text"]
+assert fire(["antigravity"], json.dumps({"conversationId": "c1", "workspacePaths": [r"C:\code\rateup-api"]}).replace("{", '{"hook_event_name": "Stop", ', 1)).strip() == "{}"
+fire(["codex", json.dumps({"type": "agent-turn-complete", "thread-id": "t1", "cwd": "/home/x/site", "last-assistant-message": "private"})])
+names = {(a["agent"], a["project"], a["state"]) for a in cmd("agents")["data"]["sessions"]}
+assert names == {("Claude Code", "jarvis-android", "done"), ("Antigravity", "rateup-api", "done"), ("Codex", "site", "done")}, names
+fire(["claude"], json.dumps({"hook_event_name": "SessionEnd", "session_id": "s1"}))
+assert len(cmd("agents")["data"]["sessions"]) == 2
+# Nothing new: the wait answers after its time with the same version.
+L.AGENT_WAIT_S = 0.5
+v = cmd("agents_wait", {"since": -1})["data"]["v"]
+assert cmd("agents_wait", {"since": v})["data"]["v"] == v
+# Only this PC's own hook may report: the same frame from the network is refused (tested by its rule, not a real LAN).
+assert call({"t": "agent", "agent": "claude", "session": "x", "state": "done"}) == {"ok": True}  # 127.0.0.1 here
+# Setting up the hooks keeps the user's own ones, and taking ours out leaves the file as it was.
+home = Path(os.environ["APPDATA"]) / "home"
+L.CLAUDE_SETTINGS = home / ".claude" / "settings.json"
+L.ANTIGRAVITY_HOOKS = home / ".gemini" / "config" / "hooks.json"
+L.CODEX_CONFIG = home / ".codex" / "config.toml"
+for d in (L.CLAUDE_SETTINGS.parent, L.ANTIGRAVITY_HOOKS.parent, L.CODEX_CONFIG.parent):
+    d.mkdir(parents=True)
+mine = {"model": "opus", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "my-own.exe"}]}]}}
+L.CLAUDE_SETTINGS.write_text(json.dumps(mine), "utf-8")
+L.CODEX_CONFIG.write_text('model = "gpt"\n\n[profiles.x]\nmodel = "y"\n', "utf-8")
+assert not L.agent_hooks_on()
+print(L.set_agent_hooks(True))
+c = json.loads(L.CLAUDE_SETTINGS.read_text("utf-8"))
+assert c["model"] == "opus" and c["hooks"]["Stop"][0]["hooks"][0]["command"] == "my-own.exe" and len(c["hooks"]["Stop"]) == 2
+assert set(c["hooks"]) == {"Stop", "UserPromptSubmit", "PostToolUse", "Notification", "SessionEnd"}
+assert "agent_hook.py" in L.ANTIGRAVITY_HOOKS.read_text("utf-8") and L.CODEX_CONFIG.read_text("utf-8").startswith("notify = [")
+assert L.agent_hooks_on()
+L.set_agent_hooks(True)  # twice: still one of ours per event
+assert len(json.loads(L.CLAUDE_SETTINGS.read_text("utf-8"))["hooks"]["Stop"]) == 2
+print(L.set_agent_hooks(False))
+assert json.loads(L.CLAUDE_SETTINGS.read_text("utf-8")) == mine and not L.agent_hooks_on()
+assert L.CODEX_CONFIG.read_text("utf-8") == 'model = "gpt"\n\n[profiles.x]\nmodel = "y"\n'
 print("ALL OK")
 server.shutdown()

@@ -22,6 +22,15 @@ asks first if it would press Enter).
    Scan the laptop's code. Pairing is remembered on both sides; do it once.
 4. Allow Python through Windows Firewall on **Private** networks if Windows asks.
 
+## AI agents
+Tray → **Watch AI agents** adds a hook to Claude Code, Antigravity and Codex (whichever are installed; your own hooks
+are left alone, and the first change keeps a `.before-jarvis` copy of each file). They then run `agent_hook.py` on
+their events, and the phone (Settings → PC link → AI agents on the laptop) gets a notification when one finishes or
+waits for approval **while nobody has touched the laptop for a minute**. "Is Claude done?" asks too. Only the agent,
+the project folder's name and the state leave the laptop, never prompts, code or messages. No AI model is involved,
+so it uses no tokens. Antigravity has no "waiting for approval" event, so it only reports working and finished.
+Codex reports only finished. Another agent can report too: `python -S agent_hook.py <name>` with its event JSON on stdin.
+
 ## Settings
 Tray → **Settings (folders)…** opens `%APPDATA%\JARVIS Link\config.json`:
 - `workspaces`: named folders searched for projects (a folder with .git, package.json, build.gradle, pyproject…), e.g. `{"Abhi": "C:\DILSHA\ABHI", "RateUp": "C:\DILSHA\rateup-abhi"}` — "open the RateUp api" picks rateup-api there.

@@ -191,7 +191,7 @@ class Replays:
 REPLAYS = Replays()
 
 # Many to a second, or one piece of a file: not written to the log one by one.
-QUIET_ACTIONS = {"file_chunk", "file_get_chunk", "pointer", "key"}
+QUIET_ACTIONS = {"file_chunk", "file_get_chunk", "pointer", "key", "agents_wait"}
 _last_seen_saved: dict[str, int] = {}
 
 
@@ -1582,6 +1582,228 @@ def act_screenshot(args):
     return True, "Took a screenshot.", {"download": download, "name": path.name, "size": size}
 
 
+# ---------------------------------------------------------------------------------------------- AI agents
+# Claude Code, Antigravity, Codex… tell this what they're doing (agent_hook.py, run by their own hooks), and the
+# phone listens: "Claude Code needs your approval" while you're away from the laptop. Only the agent, the project
+# folder's name and the state are kept, in memory: never prompts, code or messages.
+
+AGENT_NAMES = {"claude": "Claude Code", "antigravity": "Antigravity", "codex": "Codex", "gemini": "Gemini CLI", "cursor": "Cursor"}
+AGENT_STATES = {"working", "approval", "question", "done", "ended"}
+AGENT_FORGET_S = 6 * 3600     # a session not heard from for this long is dropped
+AGENT_WAIT_S = 30             # the phone's question waits this long for a change before answering "nothing new"
+
+
+class _LastInput(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+def idle_seconds() -> int:
+    """Seconds since the keyboard or mouse was last touched: the phone speaks up only when nobody is at the laptop."""
+    li = _LastInput(ctypes.sizeof(_LastInput), 0)
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(li)):
+        return 0
+    return max(0, ((ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF) - li.dwTime) & 0xFFFFFFFF) // 1000
+
+
+class Agents:
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.version = 0
+        self.sessions: dict[str, dict] = {}
+
+    def report(self, agent: str, session: str, project: str, state: str) -> None:
+        if state not in AGENT_STATES:
+            return
+        key = f"{agent}:{session}"
+        now = time.time()
+        with self.cond:
+            old = self.sessions.get(key)
+            if state == "ended":
+                if not old:
+                    return
+                del self.sessions[key]
+            elif old and old["state"] == state:
+                old["seen"] = now
+                return
+            else:
+                self.sessions[key] = {"agent": agent, "project": project, "state": state, "since": now, "seen": now,
+                                      "change": self.version + 1}
+            self.version += 1
+            self.cond.notify_all()
+        log.info("%s: %s", AGENT_NAMES.get(agent, agent), state)
+
+    def snapshot(self) -> dict:
+        now = time.time()
+        with self.cond:
+            for k in [k for k, v in self.sessions.items() if now - v["seen"] > AGENT_FORGET_S]:
+                del self.sessions[k]
+            sessions = [{"key": k, "agent": AGENT_NAMES.get(v["agent"], v["agent"].title()), "project": v["project"],
+                         "state": v["state"], "ago": int(now - v["since"]), "change": v["change"]}
+                        for k, v in sorted(self.sessions.items(), key=lambda kv: -kv[1]["since"])]
+            return {"v": self.version, "idle": idle_seconds(), "sessions": sessions}
+
+    def wait(self, since: int, timeout: float) -> dict:
+        with self.cond:
+            self.cond.wait_for(lambda: self.version != since, timeout)
+        return self.snapshot()
+
+
+AGENTS = Agents()
+
+
+def handle_agent(req: dict) -> dict:
+    """An agent_hook.py on this PC: never from the network (the handler checks)."""
+    agent = re.sub(r"[^a-z0-9_-]", "", str(req.get("agent", "")).lower())[:20] or "agent"
+    project = re.sub(r"[\x00-\x1f]", "", str(req.get("project", "")))[:60]
+    AGENTS.report(agent, str(req.get("session", ""))[:64], project, str(req.get("state", "")))
+    return {"ok": True}
+
+
+def _agent_words(a: dict) -> str:
+    mins = a["ago"] // 60
+    ago = "just now" if mins < 1 else f"{mins} min ago" if mins < 90 else f"{mins // 60} h ago"
+    since = "" if mins < 1 else f" for {mins} min" if mins < 90 else f" for {mins // 60} h"
+    where = f" in {a['project']}" if a["project"] else ""
+    return {
+        "working": f"{a['agent']}{where} is working (started {ago})",
+        "approval": f"{a['agent']}{where} is waiting for your approval{since}",
+        "question": f"{a['agent']}{where} is asking you something{since}",
+        "done": f"{a['agent']}{where} finished {ago}",
+    }.get(a["state"], f"{a['agent']}{where}: {a['state']}")
+
+
+def act_agents(args):
+    snap = AGENTS.snapshot()
+    if not snap["sessions"]:
+        if not agent_hooks_on():
+            return True, (f"Not watching AI agents on {PC_NAME}: turn on Watch AI agents in the JARVIS Link tray menu. "
+                          "It covers Claude Code, Antigravity and Codex."), snap
+        return True, f"No AI agent on {PC_NAME} has reported anything in the last few hours.", snap
+    return True, ". ".join(_agent_words(a) for a in snap["sessions"][:6]) + ".", snap
+
+
+def act_agents_wait(args):
+    """The phone's long wait: answers as soon as something changes, or after AGENT_WAIT_S with nothing new."""
+    try:
+        since = int(args.get("since", -1))
+    except (TypeError, ValueError):
+        since = -1
+    return True, "", AGENTS.wait(since, AGENT_WAIT_S)
+
+
+# ------------------------------------------------ setting up the agents' hooks (tray → Watch AI agents)
+# Ours are told apart by agent_hook.py in the command, so the user's own hooks (and other tools') are left alone.
+
+HOOK_SCRIPT = Path(__file__).resolve().with_name("agent_hook.py")
+CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
+ANTIGRAVITY_HOOKS = Path.home() / ".gemini" / "config" / "hooks.json"
+CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
+CLAUDE_EVENTS = ["UserPromptSubmit", "PostToolUse", "Notification", "Stop", "SessionEnd"]
+ANTIGRAVITY_EVENTS = ["PreInvocation", "Stop"]
+
+
+def _hook_python() -> str:
+    python = Path(sys.executable).with_name("python.exe")  # the tray runs under pythonw; hooks want the console one
+    return str(python if python.exists() else sys.executable)
+
+
+def hook_command(agent: str) -> str:
+    return f'"{_hook_python()}" -S "{HOOK_SCRIPT}" {agent}'
+
+
+def _ours(entry) -> bool:
+    return isinstance(entry, dict) and any("agent_hook.py" in str(h.get("command", "")) for h in entry.get("hooks", []) if isinstance(h, dict))
+
+
+def _write_json(path: Path, data) -> None:
+    backup = path.with_name(path.name + ".before-jarvis")
+    if path.exists() and not backup.exists():
+        shutil.copy2(path, backup)  # the file as it was before JARVIS Link first touched it
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
+    os.replace(tmp, path)
+
+
+def _claude_hooks(on: bool) -> str | None:
+    if not CLAUDE_SETTINGS.parent.exists():
+        return None
+    data = json.loads(CLAUDE_SETTINGS.read_text("utf-8")) if CLAUDE_SETTINGS.exists() else {}
+    hooks = data.setdefault("hooks", {})
+    for event in CLAUDE_EVENTS:
+        kept = [e for e in hooks.get(event, []) if not _ours(e)]
+        if on:
+            kept.append({"hooks": [{"type": "command", "command": hook_command("claude"), "timeout": 5}]})
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event, None)
+    if not hooks:
+        data.pop("hooks")
+    _write_json(CLAUDE_SETTINGS, data)
+    return "Claude Code"
+
+
+def _antigravity_hooks(on: bool) -> str | None:
+    if not ANTIGRAVITY_HOOKS.parent.parent.exists():
+        return None
+    data = json.loads(ANTIGRAVITY_HOOKS.read_text("utf-8")) if ANTIGRAVITY_HOOKS.exists() else {}
+    data.pop("jarvis-link", None)
+    if on:
+        data["jarvis-link"] = {e: [{"hooks": [{"type": "command", "command": hook_command("antigravity"), "timeout": 5}]}]
+                               for e in ANTIGRAVITY_EVENTS}
+    ANTIGRAVITY_HOOKS.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(ANTIGRAVITY_HOOKS, data)
+    return "Antigravity"
+
+
+def _codex_hooks(on: bool) -> str | None:
+    """Codex runs one program when a turn finishes (notify = [...], a top-level key: so it goes first in the file)."""
+    if not CODEX_CONFIG.parent.exists():
+        return None
+    text = CODEX_CONFIG.read_text("utf-8") if CODEX_CONFIG.exists() else ""
+    lines = [ln for ln in text.splitlines() if not (ln.startswith("notify") and "agent_hook.py" in ln)]
+    if on:
+        if any(re.match(r"\s*notify\s*=", ln) for ln in lines):
+            return None  # the user's own notify program: left as it is
+        lines.insert(0, "notify = " + json.dumps([_hook_python(), "-S", str(HOOK_SCRIPT), "codex"]))
+    new = "\n".join(lines) + ("\n" if lines else "")
+    if new != text:
+        backup = CODEX_CONFIG.with_name(CODEX_CONFIG.name + ".before-jarvis")
+        if CODEX_CONFIG.exists() and not backup.exists():
+            shutil.copy2(CODEX_CONFIG, backup)
+        CODEX_CONFIG.write_text(new, "utf-8")
+    return "Codex"
+
+
+def agent_hooks_on() -> bool:
+    try:
+        return "agent_hook.py" in CLAUDE_SETTINGS.read_text("utf-8") or "agent_hook.py" in ANTIGRAVITY_HOOKS.read_text("utf-8")
+    except OSError:
+        return False
+
+
+def set_agent_hooks(on: bool) -> str:
+    """Adds (or removes) our hook in each agent found on this PC. Words for the tray notice."""
+    done, failed = [], []
+    for name, fn in (("Claude Code", _claude_hooks), ("Antigravity", _antigravity_hooks), ("Codex", _codex_hooks)):
+        try:
+            if fn(on):
+                done.append(name)
+        except Exception:
+            log.exception("setting up %s's hook failed", name)
+            failed.append(name)
+    log.info("agent hooks %s: %s", "on" if on else "off", ", ".join(done) or "none")
+    words = " and ".join([", ".join(done[:-1]), done[-1]] if len(done) > 1 else done)
+    if on:
+        text = (f"Watching {words}. Your phone hears when they finish or need you, if you're away from the laptop. "
+                "Sessions already open start reporting after a restart.") if done else "No AI agents found on this PC."
+    else:
+        text = f"Stopped watching {words}." if done else "Nothing to stop."
+    if failed:
+        text += f" Couldn't change {', '.join(failed)}'s settings (see the log)."
+    return text
+
+
 ACTIONS = {
     "status": act_status,
     "list_projects": act_list_projects,
@@ -1618,28 +1840,48 @@ ACTIONS = {
     "clipboard_get": act_clipboard_get,
     "pointer": act_pointer,
     "key": act_key,
+    "agents": act_agents,
+    "agents_wait": act_agents_wait,
 }
 
 
 # ---------------------------------------------------------------------------------------------- network
 
+# Adapters a phone on the Wi-Fi can never reach: WSL / Hyper-V, virtual machines, VPNs, Bluetooth.
+VIRTUAL_ADAPTER = re.compile(r"vethernet|wsl|hyper-v|virtualbox|vmware|vpn|wintun|tap-|wireguard|tailscale|zerotier|bluetooth|loopback|docker", re.I)
+PRIVATE_IP = re.compile(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)")
+
+
 def local_ips() -> list[str]:
-    """This PC's addresses on the home network (private ranges only)."""
-    ips: list[str] = []
+    """
+    This PC's addresses on the home network: private ranges, real adapters only (Wi-Fi, Ethernet), the one a LAN
+    packet would leave by first. Announcing WSL's or a VPN's address sent phones to one they can't reach.
+    """
+    first = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("192.0.2.1", 9))  # nothing is sent: this only picks the interface a LAN packet would use
-        ips.append(s.getsockname()[0])
+        first = s.getsockname()[0]
         s.close()
     except OSError:
         pass
+    ips: list[str] = []
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ips.append(info[4][0])
-    except OSError:
-        pass
-    private = re.compile(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)")
-    return list(dict.fromkeys(ip for ip in ips if private.match(ip)))
+        import ifaddr
+        for adapter in ifaddr.get_adapters():
+            if VIRTUAL_ADAPTER.search(adapter.nice_name or ""):
+                continue
+            ips += [ip.ip for ip in adapter.ips if isinstance(ip.ip, str)]
+    except Exception:  # without ifaddr: every address the PC's name has, as before
+        try:
+            ips += [info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)]
+        except OSError:
+            pass
+    ips = [ip for ip in ips if PRIVATE_IP.match(ip)]
+    if first in ips:  # the default route's first, when it is one of the real ones (not the VPN's)
+        ips.remove(first)
+        ips.insert(0, first)
+    return list(dict.fromkeys(ips))
 
 
 def read_frame(sock: socket.socket) -> dict | None:
@@ -1691,6 +1933,8 @@ class Handler(socketserver.BaseRequestHandler):
                     reply = handle_pair(req)
                 elif t == "cmd":
                     reply = handle_cmd(req)
+                elif t == "agent" and peer == "127.0.0.1":
+                    reply = handle_agent(req)
                 else:
                     reply = {"ok": False, "error": "unknown"}
                 write_frame(self.request, reply)
@@ -1714,23 +1958,30 @@ def advertise():
     except ImportError:
         log.warning("zeroconf is not installed: phones will use the address they paired with")
         return
-    zc = Zeroconf(ip_version=IPVersion.V4Only)
+    zc = None
     info = None
     last: list[str] = []
     while True:
         ips = local_ips()
         if ips != last:
+            # Started fresh on the new addresses: a Zeroconf made before the Wi-Fi came up (just after a restart)
+            # keeps listening on what was there then, and phones never heard it — they had to pair again.
             try:
-                if info:
-                    zc.unregister_service(info)
-                info = ServiceInfo(SERVICE, f"JARVIS Link {AGENT_ID[:8]}.{SERVICE}", port=PORT, parsed_addresses=ips,
-                                   properties={"id": AGENT_ID, "name": PC_NAME})
-                zc.register_service(info)
-                log.info("advertising on %s", ", ".join(ips))
+                if zc:
+                    if info:
+                        zc.unregister_service(info)
+                    zc.close()
+                zc = info = None
+                if ips:
+                    zc = Zeroconf(interfaces=ips, ip_version=IPVersion.V4Only)
+                    info = ServiceInfo(SERVICE, f"JARVIS Link {AGENT_ID[:8]}.{SERVICE}", port=PORT, parsed_addresses=ips,
+                                       properties={"id": AGENT_ID, "name": PC_NAME})
+                    zc.register_service(info)
+                log.info("advertising on %s", ", ".join(ips) or "nothing (no network)")
                 last = ips
             except Exception:
                 log.exception("mDNS registration failed")
-        time.sleep(60)
+        time.sleep(15)
 
 
 # ---------------------------------------------------------------------------------------------- tray & windows
@@ -1944,6 +2195,10 @@ def run_ui():
     def toggle_startup(icon_, item):
         start_with_windows(not STARTUP_FILE.exists())
 
+    def toggle_agents(icon_, item):
+        notice(set_agent_hooks(not agent_hooks_on()))
+        jobs.put(icon.update_menu)
+
     def quit_(icon_, item):
         icon.stop()
         jobs.put(root.destroy)
@@ -1958,6 +2213,7 @@ def run_ui():
             pystray.MenuItem(lambda item: f"Cancel {(power_pending() or 'shutdown').lower()}",
                              lambda i, it: act_cancel_shutdown({}), visible=lambda item: power_pending() is not None),
             pystray.MenuItem("Start with Windows", toggle_startup, checked=lambda item: STARTUP_FILE.exists()),
+            pystray.MenuItem("Watch AI agents", toggle_agents, checked=lambda item: agent_hooks_on()),
             pystray.MenuItem("Open log", lambda i, it: os.startfile(LOG_FILE)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", quit_),
