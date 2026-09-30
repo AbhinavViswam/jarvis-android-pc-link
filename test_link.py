@@ -134,6 +134,7 @@ fire(["claude"], json.dumps({"hook_event_name": "Notification", "session_id": "s
 assert cmd("agents")["data"]["sessions"][0]["state"] == "approval"  # an idle reminder changes nothing
 fire(["claude"], json.dumps({"hook_event_name": "Stop", "session_id": "s1", "cwd": r"C:\code\jarvis-android"}))
 assert "finished" in cmd("agents")["text"]
+assert cmd("agents")["data"]["sessions"][0]["took"] >= 0  # how long it worked, for the phone's "long task" rule
 assert fire(["antigravity"], json.dumps({"conversationId": "c1", "workspacePaths": [r"C:\code\rateup-api"]}).replace("{", '{"hook_event_name": "Stop", ', 1)).strip() == "{}"
 fire(["codex", json.dumps({"type": "agent-turn-complete", "thread-id": "t1", "cwd": "/home/x/site", "last-assistant-message": "private"})])
 names = {(a["agent"], a["project"], a["state"]) for a in cmd("agents")["data"]["sessions"]}
@@ -161,7 +162,9 @@ print(L.set_agent_hooks(True))
 c = json.loads(L.CLAUDE_SETTINGS.read_text("utf-8"))
 assert c["model"] == "opus" and c["hooks"]["Stop"][0]["hooks"][0]["command"] == "my-own.exe" and len(c["hooks"]["Stop"]) == 2
 assert set(c["hooks"]) == {"Stop", "UserPromptSubmit", "PostToolUse", "Notification", "SessionEnd"}
-assert "agent_hook.py" in L.ANTIGRAVITY_HOOKS.read_text("utf-8") and L.CODEX_CONFIG.read_text("utf-8").startswith("notify = [")
+g = json.loads(L.ANTIGRAVITY_HOOKS.read_text("utf-8"))["jarvis-link"]
+assert g["Stop"][0]["command"].endswith(" antigravity Stop") and " " not in g["Stop"][0]["command"].split(" -S ")[0]
+assert L.CODEX_CONFIG.read_text("utf-8").startswith("notify = [")
 assert L.agent_hooks_on()
 L.set_agent_hooks(True)  # twice: still one of ours per event
 assert len(json.loads(L.CLAUDE_SETTINGS.read_text("utf-8"))["hooks"]["Stop"]) == 2

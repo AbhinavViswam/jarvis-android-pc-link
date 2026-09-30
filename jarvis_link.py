@@ -1626,8 +1626,10 @@ class Agents:
                 old["seen"] = now
                 return
             else:
+                # How long it worked before this: a long task finishing is news even to someone at the laptop.
+                took = int(now - old["since"]) if old and old["state"] == "working" else (old or {}).get("took", 0)
                 self.sessions[key] = {"agent": agent, "project": project, "state": state, "since": now, "seen": now,
-                                      "change": self.version + 1}
+                                      "change": self.version + 1, "took": took}
             self.version += 1
             self.cond.notify_all()
         log.info("%s: %s", AGENT_NAMES.get(agent, agent), state)
@@ -1638,7 +1640,7 @@ class Agents:
             for k in [k for k, v in self.sessions.items() if now - v["seen"] > AGENT_FORGET_S]:
                 del self.sessions[k]
             sessions = [{"key": k, "agent": AGENT_NAMES.get(v["agent"], v["agent"].title()), "project": v["project"],
-                         "state": v["state"], "ago": int(now - v["since"]), "change": v["change"]}
+                         "state": v["state"], "ago": int(now - v["since"]), "change": v["change"], "took": v.get("took", 0)}
                         for k, v in sorted(self.sessions.items(), key=lambda kv: -kv[1]["since"])]
             return {"v": self.version, "idle": idle_seconds(), "sessions": sessions}
 
@@ -1711,6 +1713,20 @@ def hook_command(agent: str) -> str:
     return f'"{_hook_python()}" -S "{HOOK_SCRIPT}" {agent}'
 
 
+def _short_path(path: str) -> str:
+    """Windows' 8.3 name for [path] (no spaces), or the path as it is if there isn't one."""
+    buf = ctypes.create_unicode_buffer(1024)
+    return buf.value if ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, 1024) else str(path)
+
+
+def antigravity_command(event: str) -> str:
+    """
+    Antigravity's hook command: short paths, because it hands the command to cmd.exe with its quotes escaped (a path
+    with a space, like "AI ASSISTANTS", then isn't found); and the event named, because its payload doesn't say which.
+    """
+    return f"{_short_path(_hook_python())} -S {_short_path(str(HOOK_SCRIPT))} antigravity {event}"
+
+
 def _ours(entry) -> bool:
     return isinstance(entry, dict) and any("agent_hook.py" in str(h.get("command", "")) for h in entry.get("hooks", []) if isinstance(h, dict))
 
@@ -1749,7 +1765,9 @@ def _antigravity_hooks(on: bool) -> str | None:
     data = json.loads(ANTIGRAVITY_HOOKS.read_text("utf-8")) if ANTIGRAVITY_HOOKS.exists() else {}
     data.pop("jarvis-link", None)
     if on:
-        data["jarvis-link"] = {e: [{"hooks": [{"type": "command", "command": hook_command("antigravity"), "timeout": 5}]}]
+        # Its events without a matcher take the command itself, not Claude Code's {"hooks": [...]} (that's refused:
+        # "command hook must specify 'command'").
+        data["jarvis-link"] = {e: [{"type": "command", "command": antigravity_command(e), "timeout": 5}]
                                for e in ANTIGRAVITY_EVENTS}
     ANTIGRAVITY_HOOKS.parent.mkdir(parents=True, exist_ok=True)
     _write_json(ANTIGRAVITY_HOOKS, data)
@@ -1777,7 +1795,12 @@ def _codex_hooks(on: bool) -> str | None:
 
 def agent_hooks_on() -> bool:
     try:
-        return "agent_hook.py" in CLAUDE_SETTINGS.read_text("utf-8") or "agent_hook.py" in ANTIGRAVITY_HOOKS.read_text("utf-8")
+        if "agent_hook.py" in CLAUDE_SETTINGS.read_text("utf-8"):
+            return True
+    except OSError:
+        pass
+    try:
+        return '"jarvis-link"' in ANTIGRAVITY_HOOKS.read_text("utf-8")
     except OSError:
         return False
 
