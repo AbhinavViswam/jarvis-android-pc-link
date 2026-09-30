@@ -120,7 +120,7 @@ def load_config() -> dict:
         c["id"] = uuid.uuid4().hex
         changed = True
     if "workspaces" not in c and "project_roots" not in c:
-        # Named project folders: "open the RateUp website" picks the website in RateUp. Edit in Project folders….
+        # Named project folders: "open the RateUp website" picks the website in RateUp. Edit in Settings (folders)….
         home = Path.home()
         guesses = [home / "Documents", home / "Projects", home / "source" / "repos", home / "StudioProjects"]
         c["workspaces"] = {p.name: str(p) for p in guesses if p.is_dir()}
@@ -407,7 +407,7 @@ def act_list_projects(args):
     for p in all_projects():
         groups.setdefault(p.workspace or "Shortcuts", []).append(p.name)
     if not groups:
-        return True, "No projects found. Add your project folders in the JARVIS Link tray menu, Project folders.", []
+        return True, "No projects found. Add your project folders in the JARVIS Link tray menu, Settings (folders).", []
     text = "; ".join(f"{w}: " + ", ".join(sorted(n, key=str.lower)[:25]) for w, n in groups.items())
     return True, text, {w: sorted(n, key=str.lower) for w, n in groups.items()}
 
@@ -1986,6 +1986,15 @@ def advertise():
 
 # ---------------------------------------------------------------------------------------------- tray & windows
 
+def open_text_file(path: Path) -> None:
+    """Opens a settings or log file for editing: in whatever opens that kind of file, else Notepad. Many PCs have
+    nothing set for .json, and the tray's Settings did nothing at all there."""
+    try:
+        os.startfile(path)
+    except OSError:
+        subprocess.Popen(["notepad.exe", str(path)])
+
+
 def start_with_windows(on: bool) -> None:
     if on:
         pythonw = Path(sys.executable).with_name("pythonw.exe")
@@ -2209,12 +2218,12 @@ def run_ui():
             pystray.MenuItem("Open JARVIS Link", lambda i, it: jobs.put(show_window), default=True),
             pystray.MenuItem("Pair a phone…", lambda i, it: jobs.put(lambda: show_window(pair_now=True))),
             pystray.MenuItem("Files from phone", lambda i, it: act_open_received({})),
-            pystray.MenuItem("Settings (folders)…", lambda i, it: os.startfile(CONFIG_FILE)),
+            pystray.MenuItem("Settings (folders)…", lambda i, it: open_text_file(CONFIG_FILE)),
             pystray.MenuItem(lambda item: f"Cancel {(power_pending() or 'shutdown').lower()}",
                              lambda i, it: act_cancel_shutdown({}), visible=lambda item: power_pending() is not None),
             pystray.MenuItem("Start with Windows", toggle_startup, checked=lambda item: STARTUP_FILE.exists()),
             pystray.MenuItem("Watch AI agents", toggle_agents, checked=lambda item: agent_hooks_on()),
-            pystray.MenuItem("Open log", lambda i, it: os.startfile(LOG_FILE)),
+            pystray.MenuItem("Open log", lambda i, it: open_text_file(LOG_FILE)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", quit_),
         ),
