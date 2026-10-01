@@ -171,5 +171,21 @@ assert len(json.loads(L.CLAUDE_SETTINGS.read_text("utf-8"))["hooks"]["Stop"]) ==
 print(L.set_agent_hooks(False))
 assert json.loads(L.CLAUDE_SETTINGS.read_text("utf-8")) == mine and not L.agent_hooks_on()
 assert L.CODEX_CONFIG.read_text("utf-8") == 'model = "gpt"\n\n[profiles.x]\nmodel = "y"\n'
+# the phone's companions: battery news once per charge / discharge; events ride on the agents' wait
+assert L.battery_news(20, False, None) == ("low", "low") and L.battery_news(12, False, "low") == (None, "low")
+assert L.battery_news(100, True, "low") == ("full", "full") and L.battery_news(60, False, "full") == (None, None)
+before = L.AGENTS.snapshot()["last_event"]
+L.reply_to_phone("k1", "on my way")
+snap = L.AGENTS.snapshot()
+assert snap["last_event"] == before + 1 and snap["events"][-1] == {"id": before + 1, "kind": "reply", "key": "k1", "text": "on my way"}
+shown = []
+L.NOTE_HOOK = shown.append
+assert L.act_phone_notify({"app": "WhatsApp", "title": "Ravi", "text": "hi", "key": "k", "reply": "true"})[0]
+assert shown[-1]["reply"] is True and shown[-1]["title"] == "Ravi"
+L.CONFIG["phone_notifications"] = False
+L.act_phone_notify({"title": "x"})
+assert len(shown) == 1
+L.CONFIG["phone_notifications"] = True
+L._from_phone["text"] = None
 print("ALL OK")
 server.shutdown()

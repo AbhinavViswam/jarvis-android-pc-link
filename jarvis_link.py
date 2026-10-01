@@ -131,6 +131,10 @@ def load_config() -> dict:
     c.setdefault("aliases", {})          # "jarvis": "C:\\...\\jarvis-android"
     c.setdefault("editor", "code")       # a command on PATH; the folder is passed to it. "explorer" opens the folder.
     c.setdefault("name", socket.gethostname())
+    # The phone's companions (tray menu): the clipboard both ways, battery news, the phone's notifications here.
+    c.setdefault("share_clipboard", True)
+    c.setdefault("battery_alerts", True)
+    c.setdefault("phone_notifications", True)
     if changed:
         _save(CONFIG_FILE, c)
     return c
@@ -191,7 +195,7 @@ class Replays:
 REPLAYS = Replays()
 
 # Many to a second, or one piece of a file: not written to the log one by one.
-QUIET_ACTIONS = {"file_chunk", "file_get_chunk", "pointer", "key", "agents_wait"}
+QUIET_ACTIONS = {"file_chunk", "file_get_chunk", "pointer", "key", "agents_wait", "phone_notify"}
 _last_seen_saved: dict[str, int] = {}
 
 
@@ -511,6 +515,7 @@ def act_clipboard(args):
     if not text:
         return False, "Nothing to copy.", None
     subprocess.run(["clip"], input=text.encode("utf-16-le"), check=True, creationflags=0x08000000)
+    _from_phone["text"] = text.rstrip("\r\n")
     return True, "Copied to the PC's clipboard.", None
 
 
@@ -1610,6 +1615,18 @@ class Agents:
         self.cond = threading.Condition()
         self.version = 0
         self.sessions: dict[str, dict] = {}
+        # News for the phone that isn't an agent: the clipboard, the battery, a reply typed here. Numbered, so the
+        # phone acts on each once; only the last few, and only fresh ones, ride along.
+        self.events: list[dict] = []
+        self.event_id = 0
+
+    def push(self, kind: str, **fields) -> None:
+        with self.cond:
+            self.event_id += 1
+            self.events.append({"id": self.event_id, "kind": kind, "at": time.time(), **fields})
+            del self.events[:-EVENTS_KEPT]
+            self.version += 1
+            self.cond.notify_all()
 
     def report(self, agent: str, session: str, project: str, state: str) -> None:
         if state not in AGENT_STATES:
@@ -1642,7 +1659,8 @@ class Agents:
             sessions = [{"key": k, "agent": AGENT_NAMES.get(v["agent"], v["agent"].title()), "project": v["project"],
                          "state": v["state"], "ago": int(now - v["since"]), "change": v["change"], "took": v.get("took", 0)}
                         for k, v in sorted(self.sessions.items(), key=lambda kv: -kv[1]["since"])]
-            return {"v": self.version, "idle": idle_seconds(), "sessions": sessions}
+            events = [{k: v for k, v in e.items() if k != "at"} for e in self.events if now - e["at"] < EVENT_FRESH_S]
+            return {"v": self.version, "idle": idle_seconds(), "sessions": sessions, "events": events, "last_event": self.event_id}
 
     def wait(self, since: int, timeout: float) -> dict:
         with self.cond:
@@ -1691,6 +1709,88 @@ def act_agents_wait(args):
     except (TypeError, ValueError):
         since = -1
     return True, "", AGENTS.wait(since, AGENT_WAIT_S)
+
+
+# ------------------------------------------------ the phone's companions: clipboard, battery, notifications
+
+EVENTS_KEPT = 10
+EVENT_FRESH_S = 120
+_from_phone: dict = {"text": None}
+NOTE_HOOK = None  # the tray UI's "show this notification", set by run_ui
+
+
+def _clipboard_private() -> bool:
+    """Password managers mark what they copy so clipboard history and sync leave it alone; so do we."""
+    for fmt in ("ExcludeClipboardContentFromMonitorProcessing", "Clipboard Viewer Ignore"):
+        f = _u32.RegisterClipboardFormatW(fmt)
+        if f and _u32.IsClipboardFormatAvailable(f):
+            return True
+    return False
+
+
+def watch_clipboard():
+    """Text copied on this PC goes to the phone's clipboard (while the phone is listening, i.e. JARVIS is running)."""
+    _u32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+    last = _u32.GetClipboardSequenceNumber()
+    while True:
+        time.sleep(0.7)
+        seq = _u32.GetClipboardSequenceNumber()
+        if seq == last:
+            continue
+        last = seq
+        if not CONFIG.get("share_clipboard", True) or _clipboard_private():
+            continue
+        try:
+            ok, _, data = act_clipboard_get({})
+        except Exception:
+            continue
+        text = (data or {}).get("text", "") if ok else ""
+        if not text.strip() or text.rstrip("\r\n") == _from_phone["text"]:
+            continue
+        AGENTS.push("clip", text=text[:MAX_CLIP])
+
+
+def battery_news(percent: int, on_power: bool, told: str | None) -> tuple[str | None, str | None]:
+    """(what to tell now, what has been told): low once per discharge at 20%, full once per charge at 100%."""
+    if on_power and told == "low" or not on_power and told == "full":
+        told = None
+    if not on_power and percent <= 20 and told != "low":
+        return "low", "low"
+    if on_power and percent >= 100 and told != "full":
+        return "full", "full"
+    return None, told
+
+
+def watch_battery():
+    told = None
+    while True:
+        s = _Power()
+        if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(s)) and s.BatteryFlag != -128 and 0 <= s.BatteryLifePercent <= 100:
+            news, told = battery_news(s.BatteryLifePercent, s.ACLineStatus == 1, told)
+            if news and CONFIG.get("battery_alerts", True):
+                AGENTS.push("battery", state=news, percent=int(s.BatteryLifePercent))
+                log.info("battery %s (%d%%)", news, s.BatteryLifePercent)
+        time.sleep(60)
+
+
+def act_phone_notify(args):
+    """A notification from the phone, shown here; a reply typed into it goes back to the phone's app."""
+    if not CONFIG.get("phone_notifications", True):
+        return True, "", None
+    note = {
+        "app": re.sub(r"[\x00-\x1f]", " ", str(args.get("app", "")))[:40],
+        "title": re.sub(r"[\x00-\x1f]", " ", str(args.get("title", "")))[:120],
+        "text": str(args.get("text", ""))[:600],
+        "key": str(args.get("key", ""))[:300],
+        "reply": str(args.get("reply", "")).lower() == "true",
+    }
+    if NOTE_HOOK:
+        NOTE_HOOK(note)
+    return True, "", None
+
+
+def reply_to_phone(key: str, text: str) -> None:
+    AGENTS.push("reply", key=key, text=text[:2_000])
 
 
 # ------------------------------------------------ setting up the agents' hooks (tray → Watch AI agents)
@@ -1834,6 +1934,7 @@ ACTIONS = {
     "open_app": act_open_app,
     "open_url": act_open_url,
     "clipboard": act_clipboard,
+    "phone_notify": act_phone_notify,
     "lock": act_lock,
     "sleep": act_sleep,
     "media": act_media,
@@ -2227,6 +2328,109 @@ def run_ui():
     def toggle_startup(icon_, item):
         start_with_windows(not STARTUP_FILE.exists())
 
+    def toggle_config(key):
+        def flip(icon_, item):
+            CONFIG[key] = not CONFIG.get(key, True)
+            _save(CONFIG_FILE, CONFIG)
+            jobs.put(icon.update_menu)
+        return flip
+
+    notes: list = []
+
+    def show_note(note: dict):
+        """The phone's notification: bottom right, over everything, gone after a while unless you're replying."""
+        w = tk.Toplevel(root)
+        w.overrideredirect(True)
+        w.attributes("-topmost", True)
+        w.configure(bg=CARD, highlightthickness=1, highlightbackground="#30363d")
+        inner = tk.Frame(w, bg=CARD, padx=14, pady=10)
+        inner.pack(fill="both")
+        head = tk.Frame(inner, bg=CARD)
+        head.pack(fill="x")
+        tk.Label(head, text=f"Phone  ·  {note['app']}" if note["app"] else "Phone", bg=CARD, fg=DIM, font=(FONT, 9)).pack(side="left")
+        state = {"typing": False, "inside": False}
+
+        def close():
+            if w in notes:
+                notes.remove(w)
+            if w.winfo_exists():
+                w.destroy()
+            place()
+
+        x = tk.Label(head, text="✕", bg=CARD, fg=DIM, font=(FONT, 10), cursor="hand2")
+        x.pack(side="right")
+        x.bind("<Button-1>", lambda e: close())
+        if note["title"]:
+            tk.Label(inner, text=note["title"], bg=CARD, fg=TEXT, font=(FONT, 10, "bold"), anchor="w",
+                     justify="left", wraplength=320).pack(fill="x", pady=(4, 0))
+        if note["text"]:
+            body = note["text"] if len(note["text"]) <= 280 else note["text"][:277] + "…"
+            tk.Label(inner, text=body, bg=CARD, fg=TEXT, font=(FONT, 10), anchor="w", justify="left",
+                     wraplength=320).pack(fill="x", pady=(2, 0))
+        if note["reply"] and note["key"]:
+            row = tk.Frame(inner, bg=CARD)
+            row.pack(fill="x", pady=(8, 0))
+            entry = tk.Entry(row, bg=BG, fg=TEXT, insertbackground=TEXT, relief="flat", font=(FONT, 10))
+            entry.insert(0, "Reply…")
+            entry.config(fg=DIM)
+
+            def focus_in(e):
+                state["typing"] = True
+                if entry.get() == "Reply…":
+                    entry.delete(0, "end")
+                    entry.config(fg=TEXT)
+
+            def send(e=None):
+                text = entry.get().strip()
+                if not text or text == "Reply…":
+                    return
+                reply_to_phone(note["key"], text)
+                for child in inner.winfo_children():
+                    child.destroy()
+                tk.Label(inner, text="Reply sent from your phone ✓", bg=CARD, fg=GREEN, font=(FONT, 10)).pack(pady=6)
+                w.after(1500, close)
+
+            entry.bind("<FocusIn>", focus_in)
+            entry.bind("<Return>", send)
+            entry.pack(side="left", fill="x", expand=True, ipady=5)
+            tk.Button(row, text="Send", command=send, bg=ACCENT, fg=BG, relief="flat", font=(FONT, 9, "bold"),
+                      cursor="hand2", padx=10).pack(side="left", padx=(6, 0))
+        w.bind("<Enter>", lambda e: state.update(inside=True))
+        w.bind("<Leave>", lambda e: state.update(inside=False))
+
+        def expire():
+            if not w.winfo_exists():
+                return
+            if state["typing"] or state["inside"]:
+                w.after(3000, expire)
+            else:
+                close()
+
+        w.after(9000, expire)
+        notes.append(w)
+        while len(notes) > 3:
+            old = notes.pop(0)
+            if old.winfo_exists():
+                old.destroy()
+        place()
+
+    def place():
+        """Stacked up from above the taskbar, newest at the bottom."""
+        rect = wintypes.RECT()
+        ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)  # SPI_GETWORKAREA
+        bottom = rect.bottom - 12
+        for n in reversed(notes):
+            if not n.winfo_exists():
+                continue
+            n.update_idletasks()
+            width, height = 360, n.winfo_reqheight()
+            bottom -= height
+            n.geometry(f"{width}x{height}+{rect.right - width - 12}+{bottom}")
+            bottom -= 8
+
+    global NOTE_HOOK
+    NOTE_HOOK = lambda note: jobs.put(lambda: show_note(note))
+
     def toggle_agents(icon_, item):
         notice(set_agent_hooks(not agent_hooks_on()))
         jobs.put(icon.update_menu)
@@ -2246,6 +2450,12 @@ def run_ui():
                              lambda i, it: act_cancel_shutdown({}), visible=lambda item: power_pending() is not None),
             pystray.MenuItem("Start with Windows", toggle_startup, checked=lambda item: STARTUP_FILE.exists()),
             pystray.MenuItem("Watch AI agents", toggle_agents, checked=lambda item: agent_hooks_on()),
+            pystray.MenuItem("Phone's notifications here", toggle_config("phone_notifications"),
+                             checked=lambda item: CONFIG.get("phone_notifications", True)),
+            pystray.MenuItem("Share clipboard with phone", toggle_config("share_clipboard"),
+                             checked=lambda item: CONFIG.get("share_clipboard", True)),
+            pystray.MenuItem("Battery alerts on phone", toggle_config("battery_alerts"),
+                             checked=lambda item: CONFIG.get("battery_alerts", True)),
             pystray.MenuItem("Open log", lambda i, it: open_text_file(LOG_FILE)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", quit_),
@@ -2283,6 +2493,8 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=advertise, daemon=True).start()
     threading.Thread(target=start_apps, daemon=True).start()  # so the first "open …" needn't wait for it
+    threading.Thread(target=watch_clipboard, daemon=True).start()
+    threading.Thread(target=watch_battery, daemon=True).start()
     log.info("%s listening on port %d (%s)", APP, PORT, ", ".join(local_ips()))
     if "--headless" in sys.argv:
         threading.Event().wait()
