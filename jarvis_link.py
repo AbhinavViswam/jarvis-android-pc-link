@@ -1615,7 +1615,7 @@ class Agents:
         self.cond = threading.Condition()
         self.version = 0
         self.sessions: dict[str, dict] = {}
-        # News for the phone that isn't an agent: the clipboard, the battery, a reply typed here. Numbered, so the
+        # News for the phone that isn't an agent: the clipboard, the battery. Numbered, so the
         # phone acts on each once; only the last few, and only fresh ones, ride along.
         self.events: list[dict] = []
         self.event_id = 0
@@ -1774,23 +1774,17 @@ def watch_battery():
 
 
 def act_phone_notify(args):
-    """A notification from the phone, shown here; a reply typed into it goes back to the phone's app."""
+    """A notification from the phone, shown here (to read; replies are made on the phone)."""
     if not CONFIG.get("phone_notifications", True):
         return True, "", None
     note = {
         "app": re.sub(r"[\x00-\x1f]", " ", str(args.get("app", "")))[:40],
         "title": re.sub(r"[\x00-\x1f]", " ", str(args.get("title", "")))[:120],
         "text": str(args.get("text", ""))[:600],
-        "key": str(args.get("key", ""))[:300],
-        "reply": str(args.get("reply", "")).lower() == "true",
     }
     if NOTE_HOOK:
         NOTE_HOOK(note)
     return True, "", None
-
-
-def reply_to_phone(key: str, text: str) -> None:
-    AGENTS.push("reply", key=key, text=text[:2_000])
 
 
 # ------------------------------------------------ setting up the agents' hooks (tray → Watch AI agents)
@@ -2338,7 +2332,7 @@ def run_ui():
     notes: list = []
 
     def show_note(note: dict):
-        """The phone's notification: bottom right, over everything, gone after a while unless you're replying."""
+        """The phone's notification: bottom right, over everything, gone after a while unless the pointer is on it."""
         w = tk.Toplevel(root)
         w.overrideredirect(True)
         w.attributes("-topmost", True)
@@ -2348,7 +2342,7 @@ def run_ui():
         head = tk.Frame(inner, bg=CARD)
         head.pack(fill="x")
         tk.Label(head, text=f"Phone  ·  {note['app']}" if note["app"] else "Phone", bg=CARD, fg=DIM, font=(FONT, 9)).pack(side="left")
-        state = {"typing": False, "inside": False}
+        state = {"inside": False}
 
         def close():
             if w in notes:
@@ -2367,41 +2361,13 @@ def run_ui():
             body = note["text"] if len(note["text"]) <= 280 else note["text"][:277] + "…"
             tk.Label(inner, text=body, bg=CARD, fg=TEXT, font=(FONT, 10), anchor="w", justify="left",
                      wraplength=320).pack(fill="x", pady=(2, 0))
-        if note["reply"] and note["key"]:
-            row = tk.Frame(inner, bg=CARD)
-            row.pack(fill="x", pady=(8, 0))
-            entry = tk.Entry(row, bg=BG, fg=TEXT, insertbackground=TEXT, relief="flat", font=(FONT, 10))
-            entry.insert(0, "Reply…")
-            entry.config(fg=DIM)
-
-            def focus_in(e):
-                state["typing"] = True
-                if entry.get() == "Reply…":
-                    entry.delete(0, "end")
-                    entry.config(fg=TEXT)
-
-            def send(e=None):
-                text = entry.get().strip()
-                if not text or text == "Reply…":
-                    return
-                reply_to_phone(note["key"], text)
-                for child in inner.winfo_children():
-                    child.destroy()
-                tk.Label(inner, text="Reply sent from your phone ✓", bg=CARD, fg=GREEN, font=(FONT, 10)).pack(pady=6)
-                w.after(1500, close)
-
-            entry.bind("<FocusIn>", focus_in)
-            entry.bind("<Return>", send)
-            entry.pack(side="left", fill="x", expand=True, ipady=5)
-            tk.Button(row, text="Send", command=send, bg=ACCENT, fg=BG, relief="flat", font=(FONT, 9, "bold"),
-                      cursor="hand2", padx=10).pack(side="left", padx=(6, 0))
         w.bind("<Enter>", lambda e: state.update(inside=True))
         w.bind("<Leave>", lambda e: state.update(inside=False))
 
         def expire():
             if not w.winfo_exists():
                 return
-            if state["typing"] or state["inside"]:
+            if state["inside"]:
                 w.after(3000, expire)
             else:
                 close()

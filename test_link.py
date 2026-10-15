@@ -175,13 +175,13 @@ assert L.CODEX_CONFIG.read_text("utf-8") == 'model = "gpt"\n\n[profiles.x]\nmode
 assert L.battery_news(20, False, None) == ("low", "low") and L.battery_news(12, False, "low") == (None, "low")
 assert L.battery_news(100, True, "low") == ("full", "full") and L.battery_news(60, False, "full") == (None, None)
 before = L.AGENTS.snapshot()["last_event"]
-L.reply_to_phone("k1", "on my way")
+L.AGENTS.push("clip", text="on my way")
 snap = L.AGENTS.snapshot()
-assert snap["last_event"] == before + 1 and snap["events"][-1] == {"id": before + 1, "kind": "reply", "key": "k1", "text": "on my way"}
+assert snap["last_event"] == before + 1 and snap["events"][-1] == {"id": before + 1, "kind": "clip", "text": "on my way"}
 shown = []
 L.NOTE_HOOK = shown.append
-assert L.act_phone_notify({"app": "WhatsApp", "title": "Ravi", "text": "hi", "key": "k", "reply": "true"})[0]
-assert shown[-1]["reply"] is True and shown[-1]["title"] == "Ravi"
+assert L.act_phone_notify({"app": "WhatsApp", "title": "Ravi", "text": "hi"})[0]
+assert shown[-1] == {"app": "WhatsApp", "title": "Ravi", "text": "hi"}
 L.CONFIG["phone_notifications"] = False
 L.act_phone_notify({"title": "x"})
 assert len(shown) == 1
