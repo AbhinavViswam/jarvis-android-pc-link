@@ -1,6 +1,7 @@
 # JARVIS Link
 
-Lets JARVIS on your phone do a few things on this PC over your home Wi-Fi — independent of Mark-LIV.
+Lets JARVIS on your phone do a few things on this PC over your home Wi-Fi, or from **any network** with Tailscale (see
+[Use it from anywhere](#use-it-from-anywhere-tailscale)) — independent of Mark-LIV.
 
 "Open my jarvis-android project on the laptop", "open Spotify on the PC", "send this link to my laptop",
 "copy this to my laptop", "send my latest photo to the laptop", "pause the music on the PC", "lock my laptop", "is my laptop on?"
@@ -22,6 +23,26 @@ asks first if it would press Enter).
    Scan the laptop's code. Pairing is remembered on both sides; do it once.
 4. Allow Python through Windows Firewall on **Private** networks if Windows asks.
 
+## Use it from anywhere (Tailscale)
+Out of the box the phone and PC must be on the same Wi-Fi. To use the PC from mobile data, the office or a café, turn
+on **Work on any network**. It uses [Tailscale](https://tailscale.com), a free private network between your own
+devices: no router settings, and nothing on this PC is opened to the internet.
+
+1. Install Tailscale on the PC: **[Download for Windows](https://tailscale.com/download/windows)**, then sign in.
+2. Install Tailscale on the phone: **[Get it on Google Play](https://play.google.com/store/apps/details?id=com.tailscale.ipn)**,
+   then sign in with the **same account** and keep it connected.
+3. In the JARVIS Link window, tick **Work on any network (Tailscale)** (or tray → Work on any network).
+4. Use the link once while both are on the home Wi-Fi (or pair again). The phone learns the PC's Tailscale address
+   and uses it whenever the home Wi-Fi can't reach the PC.
+
+How it stays safe: only devices signed in to your Tailscale account can reach the PC at all, and on top of that every
+request is still sealed with the phone's own key, exactly as at home. Turn the switch off and the PC answers only the
+home Wi-Fi again.
+
+If JARVIS keeps reconnecting on the phone once Tailscale is on, the phone can't look up addresses: Tailscale's DNS
+clashes with a Private DNS such as AdGuard. In Tailscale on the phone: Settings → turn off **Use Tailscale DNS**, then
+reconnect. JARVIS Link uses the PC's Tailscale address directly, so nothing is lost. Android allows one VPN at a time, so Tailscale on the phone can't run alongside another VPN app.
+
 ## AI agents
 Tray → **Watch AI agents** adds a hook to Claude Code, Antigravity and Codex (whichever are installed; your own hooks
 are left alone, and the first change keeps a `.before-jarvis` copy of each file). They then run `agent_hook.py` on
@@ -37,11 +58,14 @@ Tray → **Settings (folders)…** opens `%APPDATA%\JARVIS Link\config.json`:
 - `aliases`: your own names, e.g. `"jarvis": "C:\...\jarvis-android"`.
 - `share_folders`: the only folders the phone may take files from (Downloads, Desktop, Documents, Pictures, Screenshots by default — the real ones, OneDrive included).
 - `editor`: `code` (VS Code) by default; `explorer` just opens the folder.
+- `any_network`: `false` by default; `true` also answers phones on your Tailscale (the window's switch sets it).
 
 ## Safety
 - Only phones paired by QR are answered; Forget one in the window (Forget on the phone removes it here too).
 - Every request/reply is AES-256-GCM encrypted with that phone's key, time-stamped, replay-checked.
 - Only the fixed actions in `ACTIONS` exist; nothing sent is ever run as a command.
-- Home-network addresses only. Log: tray → Open log.
+- Home-network addresses only, plus your own Tailscale (100.64.0.0/10) when **Work on any network** is on.
+- An address that sends 10 requests with the wrong key within 10 minutes is ignored for 10 minutes.
+- Log: tray → Open log.
 
 `.venv\Scripts\python test_link.py` pairs a pretend phone and runs the actions (uses a temporary folder, not your pairing).

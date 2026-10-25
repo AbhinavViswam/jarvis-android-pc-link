@@ -1,5 +1,6 @@
 """
-JARVIS Link — lets JARVIS on your phone do a few things on this PC, over your home Wi-Fi.
+JARVIS Link — lets JARVIS on your phone do a few things on this PC, over your home Wi-Fi (or from anywhere, with
+Tailscale).
 
   "Open my JARVIS project on the laptop", "open Spotify on the PC", "send this link to my laptop",
   "lock the laptop", "pause the music on the PC", "is the laptop on?"
@@ -11,6 +12,9 @@ How it's kept safe
     time, and is refused if it is old or a replay.
   * Only the fixed actions in ACTIONS below exist. Nothing the phone sends is ever run as a command or script.
   * Your home network only: found by the phone with mDNS, nothing is opened to the internet.
+  * "Work on any network" (off until switched on) also listens on Tailscale: a private network between your own
+    devices, signed in to your own account. Still nothing is opened to the internet: only your devices on your
+    Tailscale can reach this PC, and every request is still sealed with the phone's key as above.
 
 Runs in the system tray. Needs: pip install -r requirements.txt
 """
@@ -135,6 +139,8 @@ def load_config() -> dict:
     c.setdefault("share_clipboard", True)
     c.setdefault("battery_alerts", True)
     c.setdefault("phone_notifications", True)
+    # Off until switched on: also answer phones over Tailscale, from any network (tray menu or the window).
+    c.setdefault("any_network", False)
     if changed:
         _save(CONFIG_FILE, c)
     return c
@@ -194,6 +200,42 @@ class Replays:
 
 REPLAYS = Replays()
 
+class Strikes:
+    """
+    Addresses that keep sending requests that fail to decrypt: after 10 in 10 minutes, ignored for 10 minutes. A
+    paired phone never fails like that; something guessing does.
+    """
+
+    LIMIT, WINDOW_S = 10, 600
+
+    def __init__(self):
+        self.fails: dict[str, list[float]] = {}
+        self.lock = threading.Lock()
+
+    def _recent(self, peer: str) -> list[float]:
+        cut = time.time() - self.WINDOW_S
+        recent = [t for t in self.fails.get(peer, []) if t > cut]
+        if recent:
+            self.fails[peer] = recent
+        else:
+            self.fails.pop(peer, None)
+        return recent
+
+    def banned(self, peer: str) -> bool:
+        with self.lock:
+            return len(self._recent(peer)) >= self.LIMIT
+
+    def add(self, peer: str) -> None:
+        if not peer or peer == "127.0.0.1":
+            return
+        with self.lock:
+            self.fails.setdefault(peer, []).append(time.time())
+            if len(self._recent(peer)) == self.LIMIT:
+                log.warning("%s failed %d times: ignored for a while", peer, self.LIMIT)
+
+
+STRIKES = Strikes()
+
 # Many to a second, or one piece of a file: not written to the log one by one.
 QUIET_ACTIONS = {"file_chunk", "file_get_chunk", "pointer", "key", "agents_wait", "phone_notify"}
 _last_seen_saved: dict[str, int] = {}
@@ -217,7 +259,7 @@ class Pairing:
             self.secret = secrets.token_bytes(32)
             self.until = time.time() + PAIR_WINDOW_S
             secret = base64.urlsafe_b64encode(self.secret).decode().rstrip("=")
-        ips = ",".join(local_ips())
+        ips = ",".join(local_ips() + (tailscale_ips() if CONFIG.get("any_network") else []))
         name = re.sub(r"[^A-Za-z0-9 _.-]", "", PC_NAME)[:40]
         return f"jarvislink:{VERSION}:{AGENT_ID}:{secret}:{PORT}:{ips}:{name}"
 
@@ -235,13 +277,14 @@ class Pairing:
 PAIRING = Pairing()
 
 
-def handle_pair(req: dict) -> dict:
+def handle_pair(req: dict, peer: str = "") -> dict:
     secret = PAIRING.take()
     if secret is None:
         return {"ok": False, "error": "No pairing code is showing on the PC. Choose Pair a phone in the JARVIS Link tray menu."}
     try:
         body, _ = open_box(secret, req.get("box", ""), b"pair:" + AGENT_ID.encode())
     except Exception:
+        STRIKES.add(peer)
         return {"ok": False, "error": "That pairing code doesn't match. Scan the one on the PC again."}
     device = str(body.get("device", ""))[:64]
     key_b64 = str(body.get("key", ""))
@@ -265,16 +308,17 @@ def handle_pair(req: dict) -> dict:
     return {"ok": True, "box": seal(key, {"id": AGENT_ID, "name": PC_NAME}, b"reply:" + device.encode())}
 
 
-def handle_cmd(req: dict) -> dict:
+def handle_cmd(req: dict, peer: str = "") -> dict:
     device = str(req.get("device", ""))
     entry = paired().get(device)
-    if not entry:
+    if not entry:  # a phone forgotten here still asking: not a strike, or it couldn't pair again for a while
         return {"ok": False, "error": "not paired"}
     key = base64.b64decode(entry["key"])
     try:
         body, nonce = open_box(key, req.get("box", ""), b"cmd:" + device.encode())
     except Exception:
         log.warning("a request from %s failed to decrypt", device[:8])
+        STRIKES.add(peer)
         return {"ok": False, "error": "not paired"}
     if abs(time.time() - float(body.get("ts", 0)) / 1000) > MAX_SKEW_S or not REPLAYS.fresh(nonce):
         return {"ok": False, "box": seal(key, {"ok": False, "text": "The request was too old; the phone's and PC's clocks may differ."}, b"reply:" + device.encode())}
@@ -302,7 +346,10 @@ def handle_cmd(req: dict) -> dict:
         if device in p:
             p[device]["last_seen"] = now
             save_paired(p)
-    return {"ok": True, "box": seal(key, {"ok": ok, "text": text, "data": data}, b"reply:" + device.encode())}
+    reply = {"ok": ok, "text": text, "data": data}
+    # Where the phone can reach this PC from another network ([] when that's off): sealed, so only it learns it.
+    reply["tail"] = tailscale_ips() if CONFIG.get("any_network") else []
+    return {"ok": True, "box": seal(key, reply, b"reply:" + device.encode())}
 
 
 # ---------------------------------------------------------------------------------------------- actions
@@ -596,7 +643,12 @@ def act_status(args):
         parts.append(f"{system} {_gb(u.free)} free of {_gb(u.total)}")
     except Exception:
         pass
-    return True, ", ".join(parts) + ".", {"name": PC_NAME}
+    # How long since anyone touched the keyboard or mouse: the phone's "laptop left on" at bedtime.
+    try:
+        idle = idle_seconds()
+    except Exception:
+        idle = None
+    return True, ", ".join(parts) + ".", {"name": PC_NAME, "idle": idle}
 
 
 # ---------------------------------------------------------------------------------------------- how the PC is doing
@@ -1968,6 +2020,51 @@ ACTIONS = {
 # Adapters a phone on the Wi-Fi can never reach: WSL / Hyper-V, virtual machines, VPNs, Bluetooth.
 VIRTUAL_ADAPTER = re.compile(r"vethernet|wsl|hyper-v|virtualbox|vmware|vpn|wintun|tap-|wireguard|tailscale|zerotier|bluetooth|loopback|docker", re.I)
 PRIVATE_IP = re.compile(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)")
+# Tailscale's addresses (100.64.0.0/10). Tailscale only lets a device use the address it was given, so a request
+# from one of these comes from a device signed in to your own Tailscale.
+TAILNET_IP = re.compile(r"^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$")
+TAILSCALE_DOWNLOAD = "https://tailscale.com/download/windows"
+TAILSCALE_EXE = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Tailscale" / "tailscale.exe"
+_tail_cache: dict = {"at": 0.0, "ips": []}
+
+
+def tailscale_ips() -> list[str]:
+    """This PC's Tailscale address(es); [] when Tailscale isn't installed or isn't signed in. Cached for 30 s."""
+    if time.time() - _tail_cache["at"] < 30:
+        return _tail_cache["ips"]
+    ips: list[str] = []
+    try:
+        import ifaddr
+        for adapter in ifaddr.get_adapters():
+            if "tailscale" in (adapter.nice_name or "").lower():
+                ips += [ip.ip for ip in adapter.ips if isinstance(ip.ip, str) and TAILNET_IP.match(ip.ip)]
+    except Exception:
+        pass
+    if not ips:  # the adapter's name differs on some PCs: ask Tailscale itself
+        exe = shutil.which("tailscale") or str(TAILSCALE_EXE)
+        if Path(exe).exists():
+            try:
+                out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=5,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+                ips = [line.strip() for line in out.splitlines() if TAILNET_IP.match(line.strip())]
+            except Exception:
+                pass
+    _tail_cache.update(at=time.time(), ips=list(dict.fromkeys(ips)))
+    return _tail_cache["ips"]
+
+
+def tailscale_installed() -> bool:
+    return bool(shutil.which("tailscale")) or TAILSCALE_EXE.exists()
+
+
+def tailscale_status() -> str:
+    """What "Work on any network" can do right now, in words (the window)."""
+    ips = tailscale_ips()
+    if ips:
+        return f"Tailscale is connected on this PC ({ips[0]})."
+    if tailscale_installed():
+        return "Tailscale is installed but not connected. Open Tailscale and sign in."
+    return "Tailscale isn't installed on this PC yet."
 
 
 def local_ips() -> list[str]:
@@ -2032,8 +2129,10 @@ class Handler(socketserver.BaseRequestHandler):
     def handle(self):
         self.request.settimeout(15)
         peer = self.client_address[0]
-        # Home network only: a request from anywhere else is dropped unanswered.
-        if not re.match(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.)", peer):
+        # Home network only, plus your own Tailscale when "Work on any network" is on: anything else is dropped unanswered.
+        home = re.match(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.)", peer)
+        tail = CONFIG.get("any_network") and TAILNET_IP.match(peer)
+        if not (home or tail) or STRIKES.banned(peer):
             return
         try:
             first = True
@@ -2048,9 +2147,9 @@ class Handler(socketserver.BaseRequestHandler):
                 if t == "hello":
                     reply = {"ok": True, "id": AGENT_ID, "name": PC_NAME, "v": VERSION}
                 elif t == "pair":
-                    reply = handle_pair(req)
+                    reply = handle_pair(req, peer)
                 elif t == "cmd":
-                    reply = handle_cmd(req)
+                    reply = handle_cmd(req, peer)
                 elif t == "agent" and peer == "127.0.0.1":
                     reply = handle_agent(req)
                 else:
@@ -2178,8 +2277,8 @@ def run_ui():
             pass
 
         tk.Label(w, text=APP, bg=BG, fg=TEXT, font=(FONT, 16, "bold")).pack(anchor="w", padx=20, pady=(18, 0))
-        tk.Label(w, text=f"Lets JARVIS on your phone use {PC_NAME} over your home Wi-Fi.", bg=BG, fg=DIM,
-                 font=(FONT, 10)).pack(anchor="w", padx=20)
+        tk.Label(w, text=f"Lets JARVIS on your phone use {PC_NAME} over your home Wi-Fi, or anywhere with Tailscale.",
+                 bg=BG, fg=DIM, font=(FONT, 10)).pack(anchor="w", padx=20)
 
         # ------------------------------------------------ paired phones
         tk.Label(w, text="PAIRED PHONES", bg=BG, fg=ACCENT, font=(FONT, 9, "bold")).pack(anchor="w", padx=20, pady=(16, 4))
@@ -2226,7 +2325,7 @@ def run_ui():
         # ------------------------------------------------ pairing
         tk.Label(w, text="PAIR A PHONE", bg=BG, fg=ACCENT, font=(FONT, 9, "bold")).pack(anchor="w", padx=20, pady=(16, 4))
         pair = tk.Frame(w, bg=CARD, highlightthickness=1, highlightbackground="#30363d")
-        pair.pack(fill="x", padx=20, pady=(0, 20))
+        pair.pack(fill="x", padx=20)
         qr_label = tk.Label(pair, bg=CARD)
         note = tk.Label(pair, bg=CARD, fg=DIM, font=(FONT, 10), justify="left", wraplength=340)
         note.pack(anchor="w", padx=14, pady=(12, 6))
@@ -2255,10 +2354,49 @@ def run_ui():
 
         ui["start_pairing"] = start_pairing
 
+        # ------------------------------------------------ any network (Tailscale)
+        tk.Label(w, text="ANY NETWORK", bg=BG, fg=ACCENT, font=(FONT, 9, "bold")).pack(anchor="w", padx=20, pady=(16, 4))
+        anynet = tk.Frame(w, bg=CARD, highlightthickness=1, highlightbackground="#30363d")
+        anynet.pack(fill="x", padx=20, pady=(0, 20))
+        any_on = tk.BooleanVar(value=bool(CONFIG.get("any_network")))
+
+        def flip_any():
+            set_any_network(any_on.get())
+            draw_any()
+
+        tk.Checkbutton(anynet, text="Work on any network (Tailscale)", variable=any_on, command=flip_any,
+                       bg=CARD, fg=TEXT, selectcolor=BG, activebackground=CARD, activeforeground=TEXT,
+                       font=(FONT, 10, "bold"), cursor="hand2").pack(anchor="w", padx=10, pady=(10, 0))
+        any_note = tk.Label(anynet, bg=CARD, fg=DIM, font=(FONT, 9), justify="left", wraplength=340)
+        any_note.pack(anchor="w", padx=14, pady=(2, 6))
+        any_link = tk.Label(anynet, text="Download Tailscale for Windows ↗", bg=CARD, fg=ACCENT, font=(FONT, 10, "underline"),
+                            cursor="hand2")
+        any_link.bind("<Button-1>", lambda e: webbrowser.open(TAILSCALE_DOWNLOAD))
+        any_link.pack(anchor="w", padx=14, pady=(0, 12))
+        any_shown = {"text": None}
+
+        def draw_any():
+            if CONFIG.get("any_network"):
+                text = (tailscale_status() + " Phones on your Tailscale can reach this PC from any network. "
+                        "On the phone: install Tailscale and sign in to the same account.")
+                if tailscale_ips():
+                    text += " Pair again (or use the link once at home) so the phone learns this address."
+            else:
+                text = ("Off: home Wi-Fi only. Turn on to use this PC from anywhere through Tailscale, a free private "
+                        "network between your own devices. Nothing is opened to the internet.")
+            if text != any_shown["text"]:
+                any_shown["text"] = text
+                any_note.config(text=text, fg=GREEN if CONFIG.get("any_network") and tailscale_ips() else DIM)
+            any_on.set(bool(CONFIG.get("any_network")))
+
+        ui["draw_any"] = draw_any
+        draw_any()
+
         def tick():
             if not w.winfo_exists():
                 return
             draw_phones()
+            draw_any()
             if state["until"]:
                 at, who = PAIRING.last_paired
                 left = int(state["until"] - time.time())
@@ -2269,7 +2407,8 @@ def run_ui():
                     idle("That code expired. Show a new one when you're ready.")
                 else:
                     note.config(text=f"Scan this with JARVIS on your phone: Settings → Abilities → PC link. "
-                                     f"Works once, for {left // 60}:{left % 60:02d}. Same Wi-Fi only.", fg=DIM)
+                                     f"Works once, for {left // 60}:{left % 60:02d}. "
+                                     + ("Same Wi-Fi, or Tailscale." if CONFIG.get("any_network") and tailscale_ips() else "Same Wi-Fi only."), fg=DIM)
             w.after(1000, tick)
 
         def close():
@@ -2328,6 +2467,24 @@ def run_ui():
             _save(CONFIG_FILE, CONFIG)
             jobs.put(icon.update_menu)
         return flip
+
+    def set_any_network(on: bool):
+        CONFIG["any_network"] = on
+        _save(CONFIG_FILE, CONFIG)
+        _tail_cache["at"] = 0.0
+        log.info("work on any network: %s", "on" if on else "off")
+        if on and not tailscale_ips():
+            notice("Work on any network is on, but Tailscale isn't connected on this PC. Install it and sign in.")
+            if not tailscale_installed():
+                webbrowser.open(TAILSCALE_DOWNLOAD)
+        jobs.put(icon.update_menu)
+
+    def toggle_any_network(icon_, item):
+        def flip():
+            set_any_network(not CONFIG.get("any_network"))
+            if ui.get("draw_any") and ui.get("win") is not None and ui["win"].winfo_exists():
+                ui["draw_any"]()
+        jobs.put(flip)
 
     notes: list = []
 
@@ -2415,6 +2572,10 @@ def run_ui():
             pystray.MenuItem(lambda item: f"Cancel {(power_pending() or 'shutdown').lower()}",
                              lambda i, it: act_cancel_shutdown({}), visible=lambda item: power_pending() is not None),
             pystray.MenuItem("Start with Windows", toggle_startup, checked=lambda item: STARTUP_FILE.exists()),
+            pystray.MenuItem("Work on any network (Tailscale)", toggle_any_network,
+                             checked=lambda item: bool(CONFIG.get("any_network"))),
+            pystray.MenuItem("Download Tailscale…", lambda i, it: webbrowser.open(TAILSCALE_DOWNLOAD),
+                             visible=lambda item: bool(CONFIG.get("any_network")) and not tailscale_installed()),
             pystray.MenuItem("Watch AI agents", toggle_agents, checked=lambda item: agent_hooks_on()),
             pystray.MenuItem("Phone's notifications here", toggle_config("phone_notifications"),
                              checked=lambda item: CONFIG.get("phone_notifications", True)),
@@ -2461,7 +2622,8 @@ def main():
     threading.Thread(target=start_apps, daemon=True).start()  # so the first "open …" needn't wait for it
     threading.Thread(target=watch_clipboard, daemon=True).start()
     threading.Thread(target=watch_battery, daemon=True).start()
-    log.info("%s listening on port %d (%s)", APP, PORT, ", ".join(local_ips()))
+    log.info("%s listening on port %d (%s)%s", APP, PORT, ", ".join(local_ips()),
+             f"; any network on, Tailscale {', '.join(tailscale_ips()) or 'not connected'}" if CONFIG.get("any_network") else "")
     if "--headless" in sys.argv:
         threading.Event().wait()
     else:

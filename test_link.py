@@ -187,5 +187,22 @@ L.act_phone_notify({"title": "x"})
 assert len(shown) == 1
 L.CONFIG["phone_notifications"] = True
 L._from_phone["text"] = None
+# Work on any network: only Tailscale's own range counts, and it is off until switched on.
+for ip in ["100.64.0.1", "100.101.102.103", "100.127.255.254"]:
+    assert L.TAILNET_IP.match(ip), ip
+for ip in ["100.63.0.1", "100.128.0.1", "8.8.8.8", "100.64.0", "192.168.1.5"]:
+    assert not L.TAILNET_IP.match(ip), ip
+assert L.CONFIG.get("any_network") is False
+assert cmd("status")["tail"] == []
+# Ten keys that don't fit, from one address: that address is ignored for a while; others aren't.
+st = L.Strikes()
+for _ in range(9):
+    st.add("100.70.0.9")
+assert not st.banned("100.70.0.9")
+st.add("100.70.0.9")
+assert st.banned("100.70.0.9") and not st.banned("100.70.0.10")
+st.add("127.0.0.1")
+assert not st.banned("127.0.0.1")
+
 print("ALL OK")
 server.shutdown()
