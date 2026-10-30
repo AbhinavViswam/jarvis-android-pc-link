@@ -10,6 +10,8 @@ How it's kept safe
     restarts; remove a phone from the tray menu at any time.
   * Every request and reply is encrypted and authenticated (AES-256-GCM) with that phone's own key, carries the
     time, and is refused if it is old or a replay.
+  * Orion, the desktop assistant on this same PC, connects once with a 6-digit code shown here (Connect Orion…),
+    and every frame after that is sealed with its own key, like a phone's. Kept in orion.json.
   * Only the fixed actions in ACTIONS below exist. Nothing the phone sends is ever run as a command or script.
   * Your home network only: found by the phone with mDNS, nothing is opened to the internet.
   * "Work on any network" (off until switched on) also listens on Tailscale: a private network between your own
@@ -237,7 +239,7 @@ class Strikes:
 STRIKES = Strikes()
 
 # Many to a second, or one piece of a file: not written to the log one by one.
-QUIET_ACTIONS = {"file_chunk", "file_get_chunk", "pointer", "key", "agents_wait", "phone_notify"}
+QUIET_ACTIONS = {"file_chunk", "file_get_chunk", "pointer", "key", "agents_wait", "phone_notify", "orion_get", "orion_answer", "orion_event"}
 _last_seen_saved: dict[str, int] = {}
 
 
@@ -350,6 +352,548 @@ def handle_cmd(req: dict, peer: str = "") -> dict:
     # Where the phone can reach this PC from another network ([] when that's off): sealed, so only it learns it.
     reply["tail"] = tailscale_ips() if CONFIG.get("any_network") else []
     return {"ok": True, "box": seal(key, reply, b"reply:" + device.encode())}
+
+
+# ---------------------------------------------------------------------------------------------- Orion
+# Orion, the desktop assistant on this PC, pairs once with a 6-digit code shown here (Connect Orion…), then
+# speaks in sealed frames like a phone: its reminders, call messages and alerts reach the phone through the
+# agents' news board. Kept in orion.json, never in paired.json (that one is the phones' list).
+
+ORION_FILE = HOME / "orion.json"
+ORION_TRIES = 5               # wrong codes before the code shown is cancelled
+ORION_WAIT_S = 25             # Orion's long wait for work from the phone
+ORION_RUNNING_S = 70          # Orion heard from within this long: it's running
+ORION_MAIL_MAX = 20
+_orion_lock = threading.Lock()
+
+
+def orion() -> dict | None:
+    with _orion_lock:
+        o = _load(ORION_FILE, None)
+    return o if isinstance(o, dict) and o.get("key") else None
+
+
+def save_orion(o: dict | None) -> None:
+    with _orion_lock:
+        if o is None:
+            ORION_FILE.unlink(missing_ok=True)
+        else:
+            _save(ORION_FILE, o)
+
+
+class OrionPairing:
+    """The 6-digit code on offer for Orion, if any: once, for 3 minutes, cancelled after 5 wrong tries."""
+
+    def __init__(self):
+        self.code: str | None = None
+        self.until = 0.0
+        self.tries = 0
+        self.cancelled = False   # the last code was cancelled by wrong tries: the window says so
+        self.lock = threading.Lock()
+        self.on_paired = lambda: None
+        self.last_paired = 0.0
+
+    def start(self) -> str:
+        with self.lock:
+            self.code = f"{secrets.randbelow(10 ** 6):06d}"
+            self.until = time.time() + PAIR_WINDOW_S
+            self.tries = 0
+            self.cancelled = False
+            return self.code
+
+    def stop(self):
+        with self.lock:
+            self.code = None
+
+    def showing(self) -> bool:
+        with self.lock:
+            return self.code is not None and time.time() <= self.until
+
+    def check(self, pub: bytes, proof: str) -> tuple[str, str | None]:
+        """("ok", code) | ("none", None) no code showing | ("code", None) wrong | ("cancelled", None) too many."""
+        import hmac
+        with self.lock:
+            if self.code is None or time.time() > self.until:
+                return "none", None
+            want = hmac.new(self.code.encode(), b"orion-pair" + pub, "sha256").hexdigest()
+            if hmac.compare_digest(want, str(proof)):
+                code, self.code = self.code, None
+                return "ok", code
+            self.tries += 1
+            if self.tries >= ORION_TRIES:
+                self.code = None
+                self.cancelled = True
+                return "cancelled", None
+            return "code", None
+
+
+ORION_PAIRING = OrionPairing()
+
+
+def orion_key(shared: bytes, code: str) -> bytes:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"orion-link-v1").derive(shared + code.encode())
+
+
+def handle_orion_pair(req: dict) -> dict:
+    """Orion on this PC (the handler checks 127.0.0.1) with the code the user typed, as an HMAC proof."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    try:
+        pub = base64.b64decode(str(req.get("pub", "")))
+        their = X25519PublicKey.from_public_bytes(pub)
+    except Exception:
+        return {"ok": False, "error": "bad"}
+    result, code = ORION_PAIRING.check(pub, str(req.get("proof", "")))
+    if result != "ok":
+        if result != "none":
+            log.warning("Orion pairing: wrong code%s", " (code cancelled)" if result == "cancelled" else "")
+        return {"ok": False, "error": result}
+    mine = X25519PrivateKey.generate()
+    key = orion_key(mine.exchange(their), code)
+    now = int(time.time())
+    save_orion({"name": str(req.get("name", "Orion"))[:40], "key": base64.b64encode(key).decode(),
+                "paired_at": now, "last_seen": now})
+    ORION_STATE.clear()
+    ORION_PAIRING.last_paired = time.time()
+    log.info("Orion connected")
+    try:
+        ORION_PAIRING.on_paired()
+    except Exception:
+        log.exception("after-pairing notice failed")
+    my_pub = mine.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    return {"ok": True, "pub": base64.b64encode(my_pub).decode(),
+            "box": seal(key, {"ok": True, "link_id": AGENT_ID, "pc_name": PC_NAME}, b"orion-reply")}
+
+
+class OrionState:
+    """What Orion last said about itself (its card), when it was last heard from, and its mailbox."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.clear()
+
+    def clear(self):
+        with self.cond:
+            self.card: dict = {}
+            self.seen = 0.0
+            self.mail: list[dict] = []   # work for Orion from the phone (Phase 2); empty for now
+            self.cond.notify_all()
+
+    def heard(self):
+        self.seen = time.time()
+
+    def put(self, task: dict) -> bool:
+        with self.cond:
+            now = time.time()
+            self.mail = [t for t in self.mail if t.get("deadline", now + 1) > now]
+            if len(self.mail) >= ORION_MAIL_MAX:
+                return False
+            self.mail.append(task)
+            self.cond.notify_all()
+            return True
+
+    def take(self, timeout: float) -> list[dict]:
+        with self.cond:
+            self.cond.wait_for(lambda: bool(self.mail), timeout)
+            now = time.time()
+            out = [t for t in self.mail if t.get("deadline", now + 1) > now]
+            self.mail = []
+            return out
+
+    def status(self) -> dict:
+        if not orion():
+            return {"paired": False, "running": False, "muted": False, "speaking": False, "seen": None}
+        state = self.card.get("state") or {}
+        ago = int(time.time() - self.seen) if self.seen else None
+        running = ago is not None and ago < ORION_RUNNING_S and bool(state.get("running", True))
+        return {"paired": True, "running": running, "muted": bool(state.get("muted")) and running,
+                "speaking": bool(state.get("speaking")) and running, "seen": ago, "can": list(self.card.get("can") or [])}
+
+
+ORION_STATE = OrionState()
+ORION_WHATS = {"reminder", "call", "monitor", "alert", "note"}
+_clean = lambda s, n: re.sub(r"[\x00-\x08\x0b-\x1f]", " ", str(s or ""))[:n]
+
+ORION_DEADLINE_S = 600        # a task from the phone that Orion hasn't finished by then is dropped
+ORION_KEEP_S = 900            # tasks and their answers are kept this long, for orion_get
+ORION_FINAL = {"completed", "failed", "canceled"}
+ORION_STATES = ORION_FINAL | {"submitted", "working", "input-required"}
+ORION_CTL = {"mute", "unmute", "stop_talking", "undo"}
+_orion_offers: set[str] = set()   # files Orion offered the phone: allowed outside the shared folders
+
+
+class OrionTasks:
+    """The phone's requests to Orion and Orion's answers, by id. Never more than a few at a time."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.tasks: dict[str, dict] = {}
+
+    def new(self, kind: str, **fields) -> dict:
+        now = time.time()
+        task = {"id": ("p-" if kind == "phone" else "t-") + secrets.token_hex(6), "kind": kind, "state": "submitted", "answer": "", "at": now,
+                "deadline": now + ORION_DEADLINE_S, "hops": 1, **fields}
+        with self.cond:
+            for k in [k for k, t in self.tasks.items() if now - t["at"] > ORION_KEEP_S]:
+                del self.tasks[k]
+            self.tasks[task["id"]] = task
+        return task
+
+    def get(self, tid: str) -> dict | None:
+        with self.cond:
+            t = self.tasks.get(tid)
+            return dict(t) if t else None
+
+    def answer(self, tid: str, state: str, text: str, data=None) -> dict | None:
+        with self.cond:
+            t = self.tasks.get(tid)
+            if not t or t["state"] in ORION_FINAL:
+                return None
+            t["state"], t["answer"] = state, text
+            if data is not None:
+                t["data"] = data
+            self.cond.notify_all()
+            return dict(t)
+
+    def wait(self, tid: str, timeout: float) -> dict | None:
+        with self.cond:
+            self.cond.wait_for(lambda: self.tasks.get(tid, {}).get("state") in ORION_FINAL, timeout)
+            t = self.tasks.get(tid)
+            return dict(t) if t else None
+
+
+ORION_TASKS = OrionTasks()
+
+
+def _for_orion(t: dict) -> dict:
+    """What goes in Orion's mailbox: the task without Link's own bookkeeping."""
+    return {k: v for k, v in t.items() if k not in ("answer", "at")}
+
+
+def _task_reply(t: dict) -> tuple[bool, str, dict]:
+    done = t["state"] in ORION_FINAL
+    text = t["answer"] if done or t["answer"] else "Orion is on it. I'll tell you when it's done."
+    return t["state"] != "failed", text, {"id": t["id"], "state": t["state"], "answer": t["answer"]}
+
+
+def _orion_absent() -> str | None:
+    st = ORION_STATE.status()
+    if not st["paired"]:
+        return "Orion isn't connected to JARVIS Link on the laptop."
+    if not st["running"]:
+        return "Orion isn't running on the laptop."
+    return None
+
+
+def act_orion_ask(args):
+    """The phone asks Orion something (B1), hands over what it was doing (B3), or looks up calls / notes (B6)."""
+    absent = _orion_absent()
+    if absent:
+        return False, absent, None
+    fields = {"text": _clean(args.get("text"), 4000), "speak": bool(args.get("speak", True))}
+    query = str(args.get("query") or "")
+    if query in ("calls", "notes"):
+        fields["query"] = query
+    handoff = args.get("handoff")
+    if isinstance(handoff, dict):
+        fields["handoff"] = {"summary": _clean(handoff.get("summary"), 600), "task": _clean(handoff.get("task"), 200)}
+    files = []
+    for name in (args.get("files") or [])[:5]:
+        p = RECEIVED_DIR / _safe_name(str(name))
+        if p.is_file():
+            files.append(str(p))
+    if files:
+        fields["files"] = files
+    if not (fields["text"] or query or fields.get("handoff")):
+        return False, "What should I ask Orion?", None
+    task = ORION_TASKS.new("ask", **fields)
+    if not ORION_STATE.put(_for_orion(task)):
+        ORION_TASKS.answer(task["id"], "failed", "")
+        return False, "Orion has too much waiting already. Try again in a minute.", None
+    try:
+        wait_s = max(0.0, min(float(args.get("wait_s", 20)), 25.0))
+    except (TypeError, ValueError):
+        wait_s = 20.0
+    return _task_reply(ORION_TASKS.wait(task["id"], wait_s) or task)
+
+
+def act_orion_get(args):
+    t = ORION_TASKS.get(str(args.get("id", "")))
+    if not t:
+        return False, "I don't have that request any more.", None
+    return _task_reply(t)
+
+
+def act_orion_cancel(args):
+    t = ORION_TASKS.answer(str(args.get("id", "")), "canceled", "Cancelled.")
+    if not t:
+        return False, "That request is already finished.", None
+    ORION_STATE.put({"id": t["id"], "kind": "cancel", "deadline": time.time() + 60})
+    return True, "Cancelled.", {"id": t["id"], "state": "canceled"}
+
+
+def act_orion_ctl(args):
+    """Mute / unmute / stop talking / undo on Orion (B2, B4): no model, an answer in a few seconds."""
+    cmd = str(args.get("cmd", ""))
+    if cmd not in ORION_CTL:
+        return False, f"Orion can't {cmd}.", None
+    absent = _orion_absent()
+    if absent:
+        return False, absent, None
+    task = ORION_TASKS.new("ctl", cmd=cmd)
+    ORION_STATE.put(_for_orion(task))
+    t = ORION_TASKS.wait(task["id"], 8) or task
+    if t["state"] not in ORION_FINAL:
+        return True, "Told Orion.", {"id": t["id"], "state": t["state"]}
+    return _task_reply(t)
+
+
+PHONE_LISTENING_S = 60       # a phone that asked agents_wait this recently is listening for Orion's tasks
+_phone_seen = {"t": 0.0}
+PHONE_ACTIONS = {"battery", "ring", "stop_ring", "notifications", "remind", "open", "text", "where", "goal",
+                 "screen_read", "screen_step"}
+
+
+def phone_listening() -> bool:
+    return time.time() - _phone_seen["t"] < PHONE_LISTENING_S
+
+
+def act_orion_answer(args):
+    """The phone's answer to a task Orion gave it (Phase 3): kept for Orion's wait, and put in its mailbox."""
+    tid = str(args.get("id", ""))
+    state = str(args.get("state", "completed"))
+    if not tid.startswith("p-") or state not in ORION_STATES:
+        return False, "That isn't one of Orion's tasks.", None
+    data = args.get("data") if isinstance(args.get("data"), dict) else None
+    text = _clean(args.get("text"), 8000)
+    t = ORION_TASKS.answer(tid, state, text, data)
+    if not t:
+        return True, "", None          # cancelled or finished already: nothing to do
+    kind = "phone_answer" if state in ORION_FINAL else "phone_update"
+    if kind == "phone_answer" or text:
+        ORION_STATE.put({"id": tid, "kind": kind, "state": state, "text": text, "data": data or {},
+                         "action": t.get("action"), "deadline": time.time() + ORION_KEEP_S})
+    return True, "", None
+
+
+def act_orion_phone_confirm(args):
+    """A risky tap on the phone (from Orion's goal or remote) waits for a yes: Orion may show a click-only banner."""
+    qid = str(args.get("id", ""))
+    if not qid.startswith("q-"):
+        return False, "bad id", None
+    ORION_STATE.put({"id": qid, "kind": "phone_confirm", "title": _clean(args.get("title"), 120),
+                     "detail": _clean(args.get("detail"), 300), "deadline": time.time() + 120})
+    return True, "", None
+
+
+def act_orion_phone_confirm_done(args):
+    ORION_STATE.put({"id": str(args.get("id", ""))[:20], "kind": "phone_confirm_done", "deadline": time.time() + 120})
+    return True, "", None
+
+
+# Phase 4 ("together"): small news between the two assistants. Only these, each cleaned to its own fields.
+EVENT_FIELDS = {
+    "phone_listening": {}, "phone_idle": {},
+    "phone_call": {"state": 12, "caller": 60},
+    "briefing_handoff": {}, "briefing_done": {"date": 10},
+    "phone_state": {"battery": int, "charging": bool, "unread": int},
+    "activity": {"line": 200, "at": int},
+    "home": {"at_home": bool},
+    "memory_offer": {"items": list, "first": bool},
+    "memory_request": {},
+    # One private mode (ORION_LOCAL_BRAIN_PLAN.md P3): the newest change wins; follows = Orion keeps them too.
+    "privacy": {"on": bool, "kinds": "kinds", "updated": 25, "follows": bool},
+}
+ORION_EVENTS = {"activity", "briefing_done", "memory_offer", "memory_request", "privacy"}   # the ones Orion may send the phone
+PRIVATE_KINDS = {"relationships", "personal", "preferences", "projects", "wishes", "notes"}
+# One shared memory (user, 2026-10-30): every kind; the phone keeps its private-mode kinds back itself.
+MEMORY_CATEGORIES = {"identity", "preferences", "projects", "relationships", "wishes", "notes", "rules"}
+
+
+def clean_event(body: dict, allowed: set[str] | None = None) -> dict | None:
+    t = str(body.get("type", ""))
+    spec = EVENT_FIELDS.get(t)
+    if spec is None or (allowed is not None and t not in allowed):
+        return None
+    out = {"type": t}
+    for k, kind in spec.items():
+        v = body.get(k)
+        if v is None:
+            continue
+        try:
+            if kind is int:
+                out[k] = int(v)
+            elif kind is bool:
+                out[k] = bool(v)
+            elif kind == "kinds":
+                out[k] = sorted({str(x) for x in (v if isinstance(v, list) else []) if str(x) in PRIVATE_KINDS})
+            elif kind is list:
+                items = []
+                for it in (v if isinstance(v, list) else [])[:1000]:
+                    if isinstance(it, dict) and str(it.get("category")) in MEMORY_CATEGORIES and it.get("key"):
+                        items.append({"category": str(it["category"]), "key": _clean(it["key"], 80),
+                                      "value": _clean(it.get("value"), 1000), "updated": _clean(it.get("updated"), 25),
+                                      "deleted": bool(it.get("deleted")),
+                                      # which assistant learned the current value
+                                      "source": "orion" if str(it.get("source")) == "orion" else "jarvis"})
+                out[k] = items
+            else:
+                out[k] = _clean(v, kind)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def act_orion_event(args):
+    """News from the phone for Orion (Phase 4): its wake word, a call, the briefing, battery, activity, home, memory."""
+    ev = clean_event(args if isinstance(args, dict) else {})
+    if ev is None:
+        return False, "unknown event", None
+    if not ORION_STATE.status()["running"]:
+        return False, "Orion isn't running.", None
+    ORION_STATE.put({"id": "e-" + secrets.token_hex(4), "kind": "phone_event", **ev, "deadline": time.time() + 120})
+    return True, "", None
+
+
+def act_orion_confirm(args):
+    """Yes / No from the phone for something Orion asked to confirm (A6)."""
+    cid = str(args.get("id", ""))
+    if not cid.startswith("c-"):
+        return False, "That isn't one of Orion's questions.", None
+    ORION_STATE.put({"id": cid, "kind": "confirm_answer", "yes": bool(args.get("yes")), "deadline": time.time() + 60})
+    return True, "Told Orion: yes." if args.get("yes") else "Told Orion: no.", None
+
+
+def orion_op(op: str, body: dict) -> tuple[bool, str, object]:
+    if op == "card":
+        card = body.get("card") if isinstance(body.get("card"), dict) else {}
+        state = card.get("state") if isinstance(card.get("state"), dict) else {}
+        ORION_STATE.card = {"name": _clean(card.get("name", "Orion"), 40),
+                            "can": [_clean(c, 40) for c in (card.get("can") or [])[:40]],
+                            "state": {k: bool(state.get(k)) for k in ("running", "muted", "speaking")}}
+        return True, "", None
+    if op == "push":
+        what = str(body.get("what", "note"))
+        extra = {}
+        url = str(body.get("url") or "")
+        if re.match(r"^https?://", url, re.I) and len(url) <= 2000:
+            extra["url"] = url
+        f = body.get("file") if isinstance(body.get("file"), dict) else None
+        if f and str(f.get("id")) in _orion_offers:
+            extra["file"] = {"id": str(f["id"]), "name": _clean(f.get("name"), 120), "size": int(f.get("size") or 0)}
+        AGENTS.push("orion", what=what if what in ORION_WHATS else "note", title=_clean(body.get("title"), 80),
+                    text=_clean(body.get("text"), 600), urgent=bool(body.get("urgent")), speak=bool(body.get("speak", True)),
+                    **extra)
+        return True, "", None
+    if op == "answer":
+        state = str(body.get("state", "completed"))
+        if state not in ORION_STATES:
+            return False, "unknown state", None
+        t = ORION_TASKS.answer(str(body.get("id", "")), state, _clean(body.get("text"), 8000))
+        if not t:
+            return False, "no such task (or already finished)", None
+        if state in ORION_FINAL and t["kind"] == "ask":
+            AGENTS.push("orion", what="answer", task=t["id"], state=state, title="Orion",
+                        text=_clean(t["answer"], 600), speak=bool(body.get("speak", t.get("speak", True))))
+        return True, "", None
+    if op == "confirm":
+        cid = str(body.get("id", ""))
+        if not cid.startswith("c-"):
+            return False, "a confirmation id starts with c-", None
+        AGENTS.push("orion", what="confirm", task=cid, title=_clean(body.get("title"), 120), text=_clean(body.get("text"), 300))
+        return True, "", None
+    if op == "confirm_done":
+        AGENTS.push("orion", what="confirm_done", task=str(body.get("id", ""))[:20])
+        return True, "", None
+    if op == "event":
+        ev = clean_event(body, ORION_EVENTS)
+        if ev is None:
+            return False, "unknown event", None
+        ev.pop("at", None)             # Link stamps its own "at" on every event; the phone uses when it arrived
+        AGENTS.push("orion", what="event", **ev)
+        return True, "", None
+    if op == "phone_ask":
+        action = str(body.get("action", ""))
+        if action not in PHONE_ACTIONS:
+            return False, f"The phone can't {action}.", None
+        if not phone_listening():
+            return False, "Your phone isn't listening right now: JARVIS has to be running on it.", None
+        args = body.get("args") if isinstance(body.get("args"), dict) else {}
+        task = ORION_TASKS.new("phone", action=action, args=args)
+        AGENTS.push("orion", what="task", task=task["id"], action=action, args=args)
+        wait_s = max(0.0, min(float(body.get("wait_s", 20)), 25.0))
+        t = ORION_TASKS.wait(task["id"], wait_s) or task
+        return True, t["answer"], {"id": t["id"], "state": t["state"], "answer": t["answer"], "data": t.get("data") or {}}
+    if op == "phone_cancel":
+        t = ORION_TASKS.answer(str(body.get("id", "")), "canceled", "Cancelled.")
+        if t:
+            AGENTS.push("orion", what="task_cancel", task=t["id"])
+        return bool(t), "", None
+    if op == "phone_confirm_answer":
+        qid = str(body.get("id", ""))
+        if not qid.startswith("q-"):
+            return False, "bad id", None
+        AGENTS.push("orion", what="phone_confirm_answer", task=qid, yes=bool(body.get("yes")))
+        return True, "", None
+    if op == "offer":
+        p = Path(str(body.get("path", "")))
+        if not p.is_file():
+            return False, "No such file.", None
+        if p.stat().st_size > MAX_FILE:
+            return False, f"Files up to {MAX_FILE // 1_048_576} MB can be sent.", None
+        offer = _offer(p)
+        _orion_offers.add(offer["id"])
+        return True, "", {"id": offer["id"], "name": offer["name"], "size": offer["size"]}
+    if op == "report":
+        session = re.sub(r"[^A-Za-z0-9_.:-]", "", str(body.get("session", "")))[:64] or "orion"
+        AGENTS.report("orion", session, _clean(body.get("task"), 60), str(body.get("state", "")))
+        return True, "", None
+    if op == "wait":
+        return True, "", {"tasks": ORION_STATE.take(min(float(body.get("wait_s", ORION_WAIT_S)), ORION_WAIT_S))}
+    if op == "status":
+        return True, "", {"phones": len(paired()), "pc_name": PC_NAME, "phone_listening": phone_listening()}
+    return False, f"JARVIS Link doesn't know {op}.", None
+
+
+def handle_orion(req: dict) -> dict:
+    """A sealed frame from paired Orion (the handler checks 127.0.0.1)."""
+    entry = orion()
+    if not entry:
+        return {"ok": False, "error": "not paired"}
+    key = base64.b64decode(entry["key"])
+    aad = b"orion:" + AGENT_ID.encode()
+    try:
+        body, nonce = open_box(key, req.get("box", ""), aad)
+    except Exception:
+        log.warning("a frame from Orion failed to decrypt")
+        return {"ok": False, "error": "not paired"}
+    reply_aad = b"orion-reply:" + AGENT_ID.encode()
+    if abs(time.time() - float(body.get("ts", 0)) / 1000) > MAX_SKEW_S or not REPLAYS.fresh(nonce):
+        return {"ok": False, "box": seal(key, {"ok": False, "text": "too old"}, reply_aad)}
+    op = str(body.get("op", ""))
+    ORION_STATE.heard()
+    if op == "unpair":
+        save_orion(None)
+        ORION_STATE.clear()
+        log.info("Orion disconnected itself")
+        return {"ok": True, "box": seal(key, {"ok": True, "text": "Forgotten by JARVIS Link too.", "data": None}, reply_aad)}
+    try:
+        ok, text, data = orion_op(op, body)
+    except Exception as e:
+        log.exception("Orion op %s failed", op)
+        ok, text, data = False, f"That failed in JARVIS Link: {e.__class__.__name__}.", None
+    if op not in ("wait", "report", "card", "answer"):
+        log.info("Orion %s: %s", op, "ok" if ok else "failed")
+    now = int(time.time())
+    if now - _last_seen_saved.get("orion", 0) > 60:
+        _last_seen_saved["orion"] = now
+        o = orion()
+        if o:
+            o["last_seen"] = now
+            save_orion(o)
+    return {"ok": True, "box": seal(key, {"ok": ok, "text": text, "data": data}, reply_aad)}
 
 
 # ---------------------------------------------------------------------------------------------- actions
@@ -648,7 +1192,7 @@ def act_status(args):
         idle = idle_seconds()
     except Exception:
         idle = None
-    return True, ", ".join(parts) + ".", {"name": PC_NAME, "idle": idle}
+    return True, ", ".join(parts) + ".", {"name": PC_NAME, "idle": idle, "orion": ORION_STATE.status()}
 
 
 # ---------------------------------------------------------------------------------------------- how the PC is doing
@@ -1558,7 +2102,7 @@ def act_file_get_begin(args):
         if not found:
             return False, "No matching file in the shared folders.", None
         path = found[0]
-    if not _allowed(path):
+    if not (offered and token in _orion_offers) and not _allowed(path):
         return False, "That file isn't in a folder the phone may take files from.", None
     size = path.stat().st_size
     if size > MAX_FILE:
@@ -1644,7 +2188,7 @@ def act_screenshot(args):
 # phone listens: "Claude Code needs your approval" while you're away from the laptop. Only the agent, the project
 # folder's name and the state are kept, in memory: never prompts, code or messages.
 
-AGENT_NAMES = {"claude": "Claude Code", "antigravity": "Antigravity", "codex": "Codex", "gemini": "Gemini CLI", "cursor": "Cursor"}
+AGENT_NAMES = {"orion": "Orion", "claude": "Claude Code", "antigravity": "Antigravity", "codex": "Codex", "gemini": "Gemini CLI", "cursor": "Cursor"}
 AGENT_STATES = {"working", "approval", "question", "done", "ended"}
 AGENT_FORGET_S = 6 * 3600     # a session not heard from for this long is dropped
 AGENT_WAIT_S = 30             # the phone's question waits this long for a change before answering "nothing new"
@@ -1736,6 +2280,12 @@ def _agent_words(a: dict) -> str:
     ago = "just now" if mins < 1 else f"{mins} min ago" if mins < 90 else f"{mins // 60} h ago"
     since = "" if mins < 1 else f" for {mins} min" if mins < 90 else f" for {mins // 60} h"
     where = f" in {a['project']}" if a["project"] else ""
+    if a["agent"] == "Orion":  # Orion's "project" is the task it's on
+        task = f" on {a['project']}" if a["project"] else ""
+        return {"working": f"Orion is working{task} (started {ago})",
+                "approval": f"Orion is waiting for your approval{task}",
+                "question": f"Orion is asking you something{task}",
+                "done": f"Orion finished{task.replace(' on ', ' ', 1)} {ago}"}.get(a["state"], f"Orion: {a['state']}")
     return {
         "working": f"{a['agent']}{where} is working (started {ago})",
         "approval": f"{a['agent']}{where} is waiting for your approval{since}",
@@ -1747,7 +2297,7 @@ def _agent_words(a: dict) -> str:
 def act_agents(args):
     snap = AGENTS.snapshot()
     if not snap["sessions"]:
-        if not agent_hooks_on():
+        if not agent_hooks_on() and not orion():
             return True, (f"Not watching AI agents on {PC_NAME}: turn on Watch AI agents in the JARVIS Link tray menu. "
                           "It covers Claude Code, Antigravity and Codex."), snap
         return True, f"No AI agent on {PC_NAME} has reported anything in the last few hours.", snap
@@ -1760,7 +2310,11 @@ def act_agents_wait(args):
         since = int(args.get("since", -1))
     except (TypeError, ValueError):
         since = -1
-    return True, "", AGENTS.wait(since, AGENT_WAIT_S)
+    _phone_seen["t"] = time.time()
+    try:
+        return True, "", AGENTS.wait(since, AGENT_WAIT_S)
+    finally:
+        _phone_seen["t"] = time.time()
 
 
 # ------------------------------------------------ the phone's companions: clipboard, battery, notifications
@@ -2012,6 +2566,15 @@ ACTIONS = {
     "key": act_key,
     "agents": act_agents,
     "agents_wait": act_agents_wait,
+    "orion_ask": act_orion_ask,
+    "orion_get": act_orion_get,
+    "orion_cancel": act_orion_cancel,
+    "orion_ctl": act_orion_ctl,
+    "orion_confirm": act_orion_confirm,
+    "orion_answer": act_orion_answer,
+    "orion_event": act_orion_event,
+    "orion_phone_confirm": act_orion_phone_confirm,
+    "orion_phone_confirm_done": act_orion_phone_confirm_done,
 }
 
 
@@ -2152,6 +2715,10 @@ class Handler(socketserver.BaseRequestHandler):
                     reply = handle_cmd(req, peer)
                 elif t == "agent" and peer == "127.0.0.1":
                     reply = handle_agent(req)
+                elif t == "orion_pair" and peer == "127.0.0.1":
+                    reply = handle_orion_pair(req)
+                elif t == "orion" and peer == "127.0.0.1":
+                    reply = handle_orion(req)
                 else:
                     reply = {"ok": False, "error": "unknown"}
                 write_frame(self.request, reply)
@@ -2257,14 +2824,16 @@ def run_ui():
             return f"{s // 3600} h ago"
         return time.strftime("%d %b", time.localtime(ts))
 
-    def show_window(pair_now: bool = False):
-        """The one window: this PC's paired phones (forget any), and a QR code to pair another."""
+    def show_window(pair_now: bool = False, orion_now: bool = False):
+        """The one window: this PC's paired phones (forget any), Orion, and a QR code to pair another phone."""
         w = ui.get("win")
         if w is not None and w.winfo_exists():
             w.deiconify()
             w.lift()
             if pair_now:
                 ui["start_pairing"]()
+            if orion_now:
+                ui["orion_connect"]()
             return
         w = tk.Toplevel(root)
         ui["win"] = w
@@ -2321,6 +2890,103 @@ def run_ui():
                 tk.Button(row, text="Forget", command=lambda d=device, n=v.get("name", "phone"): forget(d, n),
                           bg=CARD, fg=RED, activebackground=CARD, activeforeground=RED, relief="flat", bd=0,
                           font=(FONT, 10), cursor="hand2").pack(side="right")
+
+        # ------------------------------------------------ Orion (the desktop assistant on this PC)
+        tk.Label(w, text="ORION", bg=BG, fg=ACCENT, font=(FONT, 9, "bold")).pack(anchor="w", padx=20, pady=(16, 4))
+        orion_box = tk.Frame(w, bg=CARD, highlightthickness=1, highlightbackground="#30363d")
+        orion_box.pack(fill="x", padx=20)
+        orow = tk.Frame(orion_box, bg=CARD)
+        orow.pack(fill="x", padx=14, pady=8)
+        odot = tk.Label(orow, text="●", bg=CARD, fg=DIM, font=(FONT, 10))
+        odot.pack(side="left")
+        oinfo = tk.Frame(orow, bg=CARD)
+        oinfo.pack(side="left", padx=(8, 0))
+        tk.Label(oinfo, text="Orion", bg=CARD, fg=TEXT, font=(FONT, 11)).pack(anchor="w")
+        oline = tk.Label(oinfo, bg=CARD, fg=DIM, font=(FONT, 9))
+        oline.pack(anchor="w")
+        obutton = tk.Button(orow, relief="flat", bd=0, font=(FONT, 10), cursor="hand2", bg=CARD, activebackground=CARD)
+        obutton.pack(side="right")
+        ocode = tk.Frame(orion_box, bg=CARD)   # the code, while one is showing
+        ocode_num = tk.Label(ocode, bg=CARD, fg=TEXT, font=("Consolas", 26, "bold"))
+        ocode_note = tk.Label(ocode, bg=CARD, fg=DIM, font=(FONT, 10), justify="left", wraplength=340)
+        ocode_cancel = tk.Button(ocode, text="Cancel", bg=CARD, fg=DIM, activebackground=CARD, relief="flat", bd=0,
+                                 font=(FONT, 10), cursor="hand2")
+        ocode_note.pack(anchor="w", padx=14, pady=(2, 0))
+        ocode_num.pack(pady=(6, 2))
+        ocode_cancel.pack(anchor="e", padx=14, pady=(0, 10))
+        ostate = {"opened": 0.0, "sig": None, "message": None, "color": DIM}
+
+        def orion_forget():
+            ostate["message"] = None
+            save_orion(None)
+            ORION_STATE.clear()
+            log.info("removed Orion")
+            draw_orion(force=True)
+
+        def orion_connect():
+            if orion():
+                from tkinter import messagebox
+                if not messagebox.askyesno(APP, "Replace the Orion that's already connected?", parent=w):
+                    return
+            ORION_PAIRING.start()
+            ostate["opened"] = time.time()
+            ostate["message"] = None
+            draw_orion(force=True)
+
+        def orion_cancel():
+            ORION_PAIRING.stop()
+            draw_orion(force=True)
+
+        ocode_cancel.config(command=orion_cancel)
+
+        def draw_orion(force: bool = False):
+            o = orion()
+            st = ORION_STATE.status()
+            showing = ORION_PAIRING.showing()
+            if ostate["opened"] and not showing:  # the code just went: why
+                if ORION_PAIRING.last_paired >= ostate["opened"]:
+                    ostate["message"], ostate["color"] = "Orion is connected. ✓", GREEN
+                elif ORION_PAIRING.cancelled:
+                    ostate["message"], ostate["color"] = "Too many wrong codes, so that code was cancelled. Click Connect Orion… for a new one.", RED
+                elif ORION_PAIRING.code is not None or time.time() > ORION_PAIRING.until:
+                    ORION_PAIRING.stop()
+                    ostate["message"], ostate["color"] = "That code expired. Click Connect Orion… for a new one.", DIM
+                ostate["opened"] = 0.0
+                ostate["msg_at"] = time.time()
+            if ostate["message"] and time.time() - ostate.get("msg_at", 0) > 20:
+                ostate["message"] = None
+            if o:
+                seen = "running now" if st["running"] else f"last seen {ago(o.get('last_seen', 0))}"
+                line, dot = f"Connected · {seen}", GREEN if st["running"] else DIM
+            else:
+                line, dot = "Not connected", DIM
+            if ostate["message"]:
+                line = ostate["message"]
+            left = int(ORION_PAIRING.until - time.time())
+            sig = (line, dot, bool(o), showing, left if showing else 0)
+            if sig == ostate["sig"] and not force:
+                return
+            ostate["sig"] = sig
+            odot.config(fg=dot)
+            oline.config(text=line, fg=ostate["color"] if ostate["message"] else DIM)
+            if o and not showing:
+                obutton.config(text="Forget", fg=RED, activeforeground=RED, command=orion_forget)
+            else:
+                obutton.config(text="Connect Orion…", fg=ACCENT, activeforeground=ACCENT, command=orion_connect)
+            if showing:
+                code = ORION_PAIRING.code or ""
+                ocode_num.config(text=f"{' '.join(code[:3])}  ·  {' '.join(code[3:])}")
+                ocode_note.config(text="In Orion, open Settings › Plugins › JARVIS Link (phone) and type this code. "
+                                       f"Works once, for {max(left, 0) // 60}:{max(left, 0) % 60:02d}.")
+                obutton.pack_forget()
+                if not ocode.winfo_ismapped():
+                    ocode.pack(fill="x")
+            else:
+                ocode.pack_forget()
+                if not obutton.winfo_ismapped():
+                    obutton.pack(side="right")
+
+        ui["orion_connect"] = orion_connect
 
         # ------------------------------------------------ pairing
         tk.Label(w, text="PAIR A PHONE", bg=BG, fg=ACCENT, font=(FONT, 9, "bold")).pack(anchor="w", padx=20, pady=(16, 4))
@@ -2396,6 +3062,7 @@ def run_ui():
             if not w.winfo_exists():
                 return
             draw_phones()
+            draw_orion()
             draw_any()
             if state["until"]:
                 at, who = PAIRING.last_paired
@@ -2413,13 +3080,17 @@ def run_ui():
 
         def close():
             PAIRING.stop()
+            ORION_PAIRING.stop()
             w.destroy()
 
         w.protocol("WM_DELETE_WINDOW", close)
         idle()
         draw_phones(force=True)
+        draw_orion(force=True)
         if pair_now:
             start_pairing()
+        if orion_now:
+            orion_connect()
         tick()
         w.update_idletasks()
         w.geometry(f"+{(w.winfo_screenwidth() - w.winfo_width()) // 2}+{(w.winfo_screenheight() - w.winfo_height()) // 3}")
@@ -2435,6 +3106,16 @@ def run_ui():
         jobs.put(note)
 
     PAIRING.on_paired = paired_done
+
+    def orion_done():
+        def note():
+            try:
+                icon.notify("Orion is connected. Its reminders and messages can now reach your phone.", APP)
+            except Exception:
+                log.exception("tray notice failed")
+        jobs.put(note)
+
+    ORION_PAIRING.on_paired = orion_done
 
     def received(name, path):
         def note():
@@ -2567,6 +3248,7 @@ def run_ui():
         menu=pystray.Menu(
             pystray.MenuItem("Open JARVIS Link", lambda i, it: jobs.put(show_window), default=True),
             pystray.MenuItem("Pair a phone…", lambda i, it: jobs.put(lambda: show_window(pair_now=True))),
+            pystray.MenuItem("Connect Orion…", lambda i, it: jobs.put(lambda: show_window(orion_now=True))),
             pystray.MenuItem("Files from phone", lambda i, it: act_open_received({})),
             pystray.MenuItem("Settings (folders)…", lambda i, it: open_text_file(CONFIG_FILE)),
             pystray.MenuItem(lambda item: f"Cancel {(power_pending() or 'shutdown').lower()}",
