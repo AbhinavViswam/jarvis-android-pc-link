@@ -457,6 +457,16 @@ assert (pv["type"], pv["on"], pv["kinds"], pv["updated"]) == ("privacy", True, [
 assert orion("event", okey, type="privacy", on=False, kinds=["notes"], updated="2026-10-30T11:00:00", follows=True)["ok"]
 ev = L.AGENTS.snapshot()["events"][-1]
 assert (ev["type"], ev["on"], ev["follows"]) == ("privacy", False, True), ev
+# Talking out loud: Orion sends JARVIS's lines, the phone answers each one and can ask for a talk
+assert orion("event", okey, type="talk_line", talk="k1", n=1, text="Evening, Orion." * 40, moment="welcome")["ok"]
+ev = L.AGENTS.snapshot()["events"][-1]
+assert (ev["type"], ev["talk"], ev["n"], ev["moment"]) == ("talk_line", "k1", 1, "welcome") and len(ev["text"]) <= 300, ev
+assert orion("event", okey, type="talk_end", talk="k1")["ok"]
+cmd("orion_event", {"type": "talk_done", "talk": "k1", "n": 1, "ok": True})
+cmd("orion_event", {"type": "talk_request", "moment": "call", "facts": "Rahul", "urgent": True})
+evs = orion("wait", okey, wait_s=0.5)["data"]["tasks"]
+assert [(e["type"], e.get("ok"), e.get("facts")) for e in evs] == [("talk_done", True, None), ("talk_request", None, "Rahul")], evs
+assert not orion("event", okey, type="talk_request", moment="asked")["ok"]   # only the phone asks Orion
 L.ORION_STATE.seen = 0
 assert not cmd("orion_event", {"type": "phone_idle"})["ok"]                 # Orion not running: dropped
 

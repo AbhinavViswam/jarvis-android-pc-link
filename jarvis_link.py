@@ -705,8 +705,15 @@ EVENT_FIELDS = {
     "memory_request": {},
     # One private mode (ORION_LOCAL_BRAIN_PLAN.md P3): the newest change wins; follows = Orion keeps them too.
     "privacy": {"on": bool, "kinds": "kinds", "updated": 25, "follows": bool},
+    # Talking out loud (ORION_JARVIS_TALK_PLAN.md): Orion runs the conversation, the phone speaks JARVIS's lines.
+    "talk_request": {"moment": 24, "facts": 1500, "urgent": bool},
+    "talk_line": {"talk": 16, "n": int, "text": 300, "moment": 24},
+    "talk_done": {"talk": 16, "n": int, "ok": bool},
+    "talk_end": {"talk": 16},
+    "talk_stop": {"talk": 16},
 }
-ORION_EVENTS = {"activity", "briefing_done", "memory_offer", "memory_request", "privacy"}   # the ones Orion may send the phone
+ORION_EVENTS = {"activity", "briefing_done", "memory_offer", "memory_request", "privacy",
+                "talk_line", "talk_end", "talk_stop"}   # the ones Orion may send the phone
 PRIVATE_KINDS = {"relationships", "personal", "preferences", "projects", "wishes", "notes"}
 # One shared memory (user, 2026-10-30): every kind; the phone keeps its private-mode kinds back itself.
 MEMORY_CATEGORIES = {"identity", "preferences", "projects", "relationships", "wishes", "notes", "rules"}
