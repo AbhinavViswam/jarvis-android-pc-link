@@ -46,6 +46,19 @@ box = L.seal(key, {"action": "status", "args": {}, "ts": int(time.time() * 1000)
 assert "box" in call({"t": "cmd", "device": device, "box": box})
 replayed = L.open_box(key, call({"t": "cmd", "device": device, "box": box})["box"], b"reply:" + device.encode())[0]
 assert not replayed["ok"], replayed
+# A newer phone's request id ("rid"): the reply is sealed to that request alone, so an old reply can't stand in.
+rid = secrets.token_hex(16)
+box = L.seal(key, {"action": "status", "args": {}, "ts": int(time.time() * 1000), "rid": rid}, b"cmd:" + device.encode())
+bound = call({"t": "cmd", "device": device, "box": box})["box"]
+assert L.open_box(key, bound, b"reply:" + device.encode() + b":" + rid.encode())[0]["ok"]
+for wrong in (b"reply:" + device.encode(), b"reply:" + device.encode() + b":" + secrets.token_hex(16).encode()):
+    try:
+        L.open_box(key, bound, wrong)
+        raise AssertionError("a reply opened for another request")
+    except AssertionError:
+        raise
+    except Exception:
+        pass
 print("best_match:", L.best_match("jarvis android", ["jarvis-android", "Mark-LIV", "Mark-LIII"]), L.best_match("mark", ["Mark-LIV", "Mark-LIII"]))
 # A file in pieces, as the phone sends it; saved under a safe name, never over another.
 from pathlib import Path

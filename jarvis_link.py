@@ -322,8 +322,12 @@ def handle_cmd(req: dict, peer: str = "") -> dict:
         log.warning("a request from %s failed to decrypt", device[:8])
         STRIKES.add(peer)
         return {"ok": False, "error": "not paired"}
+    # The reply is sealed for this one request ("rid", from a newer phone): an old reply someone recorded on the
+    # network can't be passed off as the answer to a new request. Older phones send none and get the old binding.
+    rid = body.get("rid")
+    raad = b"reply:" + device.encode() + (b":" + rid.encode() if isinstance(rid, str) and 0 < len(rid) <= 64 else b"")
     if abs(time.time() - float(body.get("ts", 0)) / 1000) > MAX_SKEW_S or not REPLAYS.fresh(nonce):
-        return {"ok": False, "box": seal(key, {"ok": False, "text": "The request was too old; the phone's and PC's clocks may differ."}, b"reply:" + device.encode())}
+        return {"ok": False, "box": seal(key, {"ok": False, "text": "The request was too old; the phone's and PC's clocks may differ."}, raad)}
     action = str(body.get("action", ""))
     args = body.get("args") or {}
     if action == "unpair":
@@ -332,7 +336,7 @@ def handle_cmd(req: dict, peer: str = "") -> dict:
         p.pop(device, None)
         save_paired(p)
         log.info("%s unpaired itself", entry.get("name", "?"))
-        return {"ok": True, "box": seal(key, {"ok": True, "text": "Forgotten on the PC too.", "data": None}, b"reply:" + device.encode())}
+        return {"ok": True, "box": seal(key, {"ok": True, "text": "Forgotten on the PC too.", "data": None}, raad)}
     fn = ACTIONS.get(action)
     try:
         ok, text, data = fn(args) if fn else (False, f"The PC doesn't know how to {action}.", None)
@@ -351,7 +355,7 @@ def handle_cmd(req: dict, peer: str = "") -> dict:
     reply = {"ok": ok, "text": text, "data": data}
     # Where the phone can reach this PC from another network ([] when that's off): sealed, so only it learns it.
     reply["tail"] = tailscale_ips() if CONFIG.get("any_network") else []
-    return {"ok": True, "box": seal(key, reply, b"reply:" + device.encode())}
+    return {"ok": True, "box": seal(key, reply, raad)}
 
 
 # ---------------------------------------------------------------------------------------------- Orion
