@@ -50,7 +50,7 @@ def details(argv: list[str]) -> dict:
     if len(argv) > 2 and argv[-1].lstrip().startswith("{"):  # Codex: the JSON is the last argument
         raw = argv[-1]
     elif not sys.stdin.isatty():
-        raw = sys.stdin.read()
+        raw = sys.stdin.buffer.read().decode("utf-8", "replace")  # agents send UTF-8, whatever Windows' code page
     try:
         p = json.loads(raw or "{}")
         return p if isinstance(p, dict) else {}

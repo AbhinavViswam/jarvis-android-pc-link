@@ -33,6 +33,7 @@ import os
 import queue
 import re
 import secrets
+import select
 import shutil
 import socket
 import socketserver
@@ -65,7 +66,10 @@ PROJECT_MARKERS = {".git", "package.json", "build.gradle", "build.gradle.kts", "
 SKIP_DIRS = {"node_modules", ".venv", "venv", "env", "__pycache__", "build", "dist", ".gradle", ".idea", "target", "bin", "obj", ".git"}
 
 HOME.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# UTF-8 (an emoji in a line otherwise failed to write and the line vanished), and never more than a few MB.
+from logging.handlers import RotatingFileHandler  # noqa: E402
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                    handlers=[RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=2, encoding="utf-8")])
 log = logging.getLogger("link")
 
 
@@ -119,12 +123,75 @@ def default_share_folders() -> dict[str, str]:
     return {n: str(v) for n, v in found.items() if v}
 
 
-def load_config() -> dict:
-    c = _load(CONFIG_FILE, {})
+ID_FILE = HOME / "id"            # this PC's id, kept apart from config.json: a typo there can never change it
+CONFIG_BAD = HOME / "config.json.bad"
+CONFIG_PROBLEM: str | None = None   # what's wrong with config.json, for the tray to tell the user
+_config_lock = threading.RLock()
+_config_state = {"mtime": None}
+
+
+def _read_config() -> dict | None:
+    """config.json as it is now: {} when there's none yet, None when it can't be read (a mistake made editing it)."""
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        c = json.loads(CONFIG_FILE.read_text("utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return c if isinstance(c, dict) else None
+
+
+def _config_mtime():
+    try:
+        return CONFIG_FILE.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _config_unreadable() -> str:
+    """Keeps a copy of the broken config.json (never overwritten here) and says what happened."""
+    try:
+        shutil.copy2(CONFIG_FILE, CONFIG_BAD)
+    except OSError:
+        pass
+    text = ("config.json has a mistake in it (a copy is in config.json.bad), so JARVIS Link is using the settings it "
+            "had. Fix it in tray → Settings: in a path write \\\\ or / instead of \\.")
+    log.warning("config.json can't be read (copied to %s); kept the old settings and this PC's id", CONFIG_BAD.name)
+    return text
+
+
+def _agent_id(c: dict | None) -> str:
+    """
+    This PC's id, which phones and Orion know it by. From its own file; else (first run after an update) the one in
+    config.json, even a broken one; a new id only on a PC that never had one.
+    """
+    try:
+        saved = ID_FILE.read_text("utf-8").strip()
+    except OSError:
+        saved = ""
+    if re.fullmatch(r"[\w-]{8,64}", saved):
+        return saved
+    found = str((c or {}).get("id", ""))
+    if not re.fullmatch(r"[\w-]{8,64}", found) and c is None:
+        try:
+            m = re.search(r'"id"\s*:\s*"([\w-]{8,64})"', CONFIG_FILE.read_text("utf-8", "replace"))
+            found = m.group(1) if m else ""
+        except OSError:
+            found = ""
+    if not re.fullmatch(r"[\w-]{8,64}", found):
+        if c is None:
+            log.warning("config.json is unreadable and holds no id: this PC has a new id; pair phones again")
+        found = uuid.uuid4().hex
+    try:
+        ID_FILE.write_text(found, "utf-8")
+    except OSError:
+        log.exception("couldn't keep this PC's id")
+    return found
+
+
+def _with_defaults(c: dict) -> bool:
+    """Fills in what config.json leaves out. True when something was added."""
     changed = False
-    if "id" not in c:
-        c["id"] = uuid.uuid4().hex
-        changed = True
     if "workspaces" not in c and "project_roots" not in c:
         # Named project folders: "open the RateUp website" picks the website in RateUp. Edit in Settings (folders)….
         home = Path.home()
@@ -143,9 +210,76 @@ def load_config() -> dict:
     c.setdefault("phone_notifications", True)
     # Off until switched on: also answer phones over Tailscale, from any network (tray menu or the window).
     c.setdefault("any_network", False)
-    if changed:
-        _save(CONFIG_FILE, c)
-    return c
+    return changed
+
+
+def load_config() -> dict:
+    """
+    config.json with its defaults. One that can't be read (a typo made editing it) is never overwritten or
+    replaced: it's copied to config.json.bad, the defaults are used for now, and the tray says so.
+    """
+    global CONFIG_PROBLEM
+    with _config_lock:
+        c = _read_config()
+        if c is None:
+            CONFIG_PROBLEM = _config_unreadable()
+        working = dict(c) if c is not None else {}
+        working["id"] = _agent_id(c)
+        changed = _with_defaults(working) or (c is not None and c.get("id") != working["id"])
+        if changed and c is not None:
+            _save(CONFIG_FILE, working)
+        _config_state["mtime"] = _config_mtime()
+        return working
+
+
+def _take_config(c: dict) -> None:
+    """Puts what's in config.json now into CONFIG, in place (other threads keep reading it meanwhile)."""
+    _with_defaults(c)
+    c["id"] = AGENT_ID
+    for k in [k for k in CONFIG if k not in c]:
+        del CONFIG[k]
+    CONFIG.update(c)
+
+
+def refresh_config() -> None:
+    """Edits made in tray → Settings take effect without a restart. A broken edit is ignored (and the tray says so)."""
+    global CONFIG_PROBLEM
+    mtime = _config_mtime()
+    if mtime is None or mtime == _config_state["mtime"]:
+        return
+    with _config_lock:
+        if mtime == _config_state["mtime"]:
+            return
+        _config_state["mtime"] = mtime
+        c = _read_config()
+        if c is None:
+            CONFIG_PROBLEM = _config_unreadable()
+            try:
+                on_notice(CONFIG_PROBLEM)
+            except Exception:
+                log.exception("tray notice failed")
+            return
+        CONFIG_PROBLEM = None
+        _take_config(c)
+        log.info("settings reloaded from config.json")
+
+
+def update_config(**changes) -> bool:
+    """
+    Changes a few settings and saves them on top of what config.json holds now, so edits made in Settings meanwhile
+    aren't lost. False (changed for now only) when config.json can't be read: it's never overwritten then.
+    """
+    with _config_lock:
+        CONFIG.update(changes)
+        c = _read_config()
+        if c is None:
+            log.warning("config.json can't be read: %s changed until JARVIS Link restarts", ", ".join(changes))
+            return False
+        c.update(changes)
+        _take_config(c)
+        _save(CONFIG_FILE, dict(CONFIG))
+        _config_state["mtime"] = _config_mtime()
+        return True
 
 
 CONFIG = load_config()
@@ -165,6 +299,14 @@ def save_paired(p: dict) -> None:
         _save(PAIRED_FILE, p)
 
 
+def update_paired(change) -> None:
+    """Reads, changes and saves paired.json in one go: a Forget can't be undone by a last-seen save in between."""
+    with _paired_lock:
+        p = _load(PAIRED_FILE, {})
+        if change(p) is not False:
+            _save(PAIRED_FILE, p)
+
+
 # ---------------------------------------------------------------------------------------------- crypto
 
 def seal(key: bytes, obj: dict, aad: bytes) -> str:
@@ -179,12 +321,36 @@ def open_box(key: bytes, box: str, aad: bytes) -> tuple[dict, bytes]:
 
 
 class Replays:
-    """Nonces seen in the last few minutes: the same request twice is refused."""
+    """
+    Nonces seen in the last few minutes: the same request twice is refused. Kept on disk too (when given a file), so
+    a request recorded on the network can't be played again just after JARVIS Link restarts.
+    """
 
-    def __init__(self):
+    _REC = struct.Struct("<12sd")    # nonce, when seen
+
+    def __init__(self, path: Path | None = None):
         self._seen: dict[bytes, float] = {}
         self._lock = threading.Lock()
         self._pruned = 0.0
+        self._path = path
+        self._compacted = time.time()
+        if path:
+            try:
+                raw = path.read_bytes()
+                now = time.time()
+                for i in range(0, len(raw) - self._REC.size + 1, self._REC.size):
+                    n, t = self._REC.unpack_from(raw, i)
+                    if now - t <= MAX_SKEW_S * 2:
+                        self._seen[n] = t
+            except (OSError, struct.error):
+                pass
+            self._write_all()
+
+    def _write_all(self) -> None:
+        try:
+            self._path.write_bytes(b"".join(self._REC.pack(n.ljust(12, b"\0")[:12], t) for n, t in self._seen.items()))
+        except OSError:
+            pass
 
     def fresh(self, nonce: bytes) -> bool:
         now = time.time()
@@ -197,10 +363,20 @@ class Replays:
             if nonce in self._seen:
                 return False
             self._seen[nonce] = now
+            if self._path:
+                if now - self._compacted > 60:   # now and then the file is rewritten with the recent ones only
+                    self._compacted = now
+                    self._write_all()
+                else:
+                    try:
+                        with open(self._path, "ab") as f:
+                            f.write(self._REC.pack(nonce.ljust(12, b"\0")[:12], now))
+                    except OSError:
+                        pass
             return True
 
 
-REPLAYS = Replays()
+REPLAYS = Replays(HOME / "replays.bin")
 
 class Strikes:
     """
@@ -297,9 +473,8 @@ def handle_pair(req: dict, peer: str = "") -> dict:
     if not device or len(key) != 32 or abs(time.time() - float(body.get("ts", 0)) / 1000) > MAX_SKEW_S:
         return {"ok": False, "error": "The pairing request was malformed or too old."}
     name = str(body.get("name", "Phone"))[:60]
-    p = paired()
-    p[device] = {"name": name, "key": key_b64, "paired_at": int(time.time()), "last_seen": int(time.time())}
-    save_paired(p)
+    update_paired(lambda p: p.update({device: {"name": name, "key": key_b64, "paired_at": int(time.time()),
+                                               "last_seen": int(time.time())}}))
     PAIRING.stop()
     PAIRING.last_paired = (time.time(), name)
     log.info("paired with %s (%s)", name, device[:8])
@@ -310,7 +485,11 @@ def handle_pair(req: dict, peer: str = "") -> dict:
     return {"ok": True, "box": seal(key, {"id": AGENT_ID, "name": PC_NAME}, b"reply:" + device.encode())}
 
 
+_request = threading.local()   # the phone whose request this thread is answering (handle_cmd)
+
+
 def handle_cmd(req: dict, peer: str = "") -> dict:
+    refresh_config()
     device = str(req.get("device", ""))
     entry = paired().get(device)
     if not entry:  # a phone forgotten here still asking: not a strike, or it couldn't pair again for a while
@@ -332,12 +511,11 @@ def handle_cmd(req: dict, peer: str = "") -> dict:
     args = body.get("args") or {}
     if action == "unpair":
         # The phone forgot this PC: forget the phone too, so the pairing is gone on both sides.
-        p = paired()
-        p.pop(device, None)
-        save_paired(p)
+        update_paired(lambda p: p.pop(device, None) is not None)
         log.info("%s unpaired itself", entry.get("name", "?"))
         return {"ok": True, "box": seal(key, {"ok": True, "text": "Forgotten on the PC too.", "data": None}, raad)}
     fn = ACTIONS.get(action)
+    _request.device = device   # which phone is asking: Orion's tasks go to one phone, not every one paired
     try:
         ok, text, data = fn(args) if fn else (False, f"The PC doesn't know how to {action}.", None)
     except Exception as e:  # an action failing must never take the link down
@@ -348,10 +526,12 @@ def handle_cmd(req: dict, peer: str = "") -> dict:
     now = int(time.time())
     if now - _last_seen_saved.get(device, 0) > 60:
         _last_seen_saved[device] = now
-        p = paired()
-        if device in p:
+
+        def seen(p):
+            if device not in p:
+                return False   # forgotten meanwhile: stays forgotten
             p[device]["last_seen"] = now
-            save_paired(p)
+        update_paired(seen)
     reply = {"ok": ok, "text": text, "data": data}
     # Where the phone can reach this PC from another network ([] when that's off): sealed, so only it learns it.
     reply["tail"] = tailscale_ips() if CONFIG.get("any_network") else []
@@ -476,6 +656,7 @@ class OrionState:
 
     def __init__(self):
         self.cond = threading.Condition()
+        self.waiter = 0   # the newest wait: an older one (Orion before it restarted) gives way to it
         self.clear()
 
     def clear(self):
@@ -500,11 +681,22 @@ class OrionState:
 
     def take(self, timeout: float) -> list[dict]:
         with self.cond:
-            self.cond.wait_for(lambda: bool(self.mail), timeout)
+            self.waiter += 1
+            me = self.waiter
+            self.cond.notify_all()
+            self.cond.wait_for(lambda: bool(self.mail) or self.waiter != me, timeout)
+            if self.waiter != me:
+                return []   # a newer wait took over: it gets the mail
             now = time.time()
             out = [t for t in self.mail if t.get("deadline", now + 1) > now]
             self.mail = []
             return out
+
+    def give_back(self, tasks: list[dict]) -> None:
+        """Mail taken by a wait whose answer couldn't be delivered (Orion had gone): first in line again."""
+        with self.cond:
+            self.mail = tasks + self.mail
+            self.cond.notify_all()
 
     def status(self) -> dict:
         if not orion():
@@ -655,7 +847,7 @@ def act_orion_ctl(args):
 
 
 PHONE_LISTENING_S = 60       # a phone that asked agents_wait this recently is listening for Orion's tasks
-_phone_seen = {"t": 0.0}
+_phone_seen = {"t": 0.0, "device": None}   # and which phone that was: Orion's tasks go to it alone
 PHONE_ACTIONS = {"battery", "ring", "stop_ring", "notifications", "remind", "open", "text", "where", "goal",
                  "screen_read", "screen_step"}
 
@@ -832,15 +1024,17 @@ def orion_op(op: str, body: dict) -> tuple[bool, str, object]:
         if not phone_listening():
             return False, "Your phone isn't listening right now: JARVIS has to be running on it.", None
         args = body.get("args") if isinstance(body.get("args"), dict) else {}
-        task = ORION_TASKS.new("phone", action=action, args=args)
-        AGENTS.push("orion", what="task", task=task["id"], action=action, args=args)
+        # One phone does it: the one listening most recently (not every phone ever paired, twice over).
+        to = _phone_seen.get("device")
+        task = ORION_TASKS.new("phone", action=action, args=args, to=to)
+        AGENTS.push("orion", what="task", task=task["id"], action=action, args=args, to=to)
         wait_s = max(0.0, min(float(body.get("wait_s", 20)), 25.0))
         t = ORION_TASKS.wait(task["id"], wait_s) or task
         return True, t["answer"], {"id": t["id"], "state": t["state"], "answer": t["answer"], "data": t.get("data") or {}}
     if op == "phone_cancel":
         t = ORION_TASKS.answer(str(body.get("id", "")), "canceled", "Cancelled.")
         if t:
-            AGENTS.push("orion", what="task_cancel", task=t["id"])
+            AGENTS.push("orion", what="task_cancel", task=t["id"], to=t.get("to"))
         return bool(t), "", None
     if op == "phone_confirm_answer":
         qid = str(body.get("id", ""))
@@ -852,17 +1046,26 @@ def orion_op(op: str, body: dict) -> tuple[bool, str, object]:
         p = Path(str(body.get("path", "")))
         if not p.is_file():
             return False, "No such file.", None
+        try:
+            p.resolve().relative_to(HOME.resolve())
+            return False, "JARVIS Link's own files (its keys and settings) are never sent.", None
+        except ValueError:
+            pass
         if p.stat().st_size > MAX_FILE:
             return False, f"Files up to {MAX_FILE // 1_048_576} MB can be sent.", None
         offer = _offer(p)
-        _orion_offers.add(offer["id"])
+        with _offers_lock:   # only offers still on: the rest have expired
+            _orion_offers.intersection_update(_offers)
+            _orion_offers.add(offer["id"])
         return True, "", {"id": offer["id"], "name": offer["name"], "size": offer["size"]}
     if op == "report":
         session = re.sub(r"[^A-Za-z0-9_.:-]", "", str(body.get("session", "")))[:64] or "orion"
         AGENTS.report("orion", session, _clean(body.get("task"), 60), str(body.get("state", "")))
         return True, "", None
     if op == "wait":
-        return True, "", {"tasks": ORION_STATE.take(min(float(body.get("wait_s", ORION_WAIT_S)), ORION_WAIT_S))}
+        tasks = ORION_STATE.take(min(float(body.get("wait_s", ORION_WAIT_S)), ORION_WAIT_S))
+        _request.taken = tasks   # given back if the answer can't reach Orion (the handler)
+        return True, "", {"tasks": tasks}
     if op == "status":
         return True, "", {"phones": len(paired()), "pc_name": PC_NAME, "phone_listening": phone_listening()}
     return False, f"JARVIS Link doesn't know {op}.", None
@@ -886,7 +1089,10 @@ def handle_orion(req: dict) -> dict:
     op = str(body.get("op", ""))
     ORION_STATE.heard()
     if op == "unpair":
-        save_orion(None)
+        with _orion_lock:   # only this pairing: not a newer one made meanwhile
+            o = _load(ORION_FILE, None)
+            if isinstance(o, dict) and o.get("key") == entry["key"]:
+                ORION_FILE.unlink(missing_ok=True)
         ORION_STATE.clear()
         log.info("Orion disconnected itself")
         return {"ok": True, "box": seal(key, {"ok": True, "text": "Forgotten by JARVIS Link too.", "data": None}, reply_aad)}
@@ -900,10 +1106,11 @@ def handle_orion(req: dict) -> dict:
     now = int(time.time())
     if now - _last_seen_saved.get("orion", 0) > 60:
         _last_seen_saved["orion"] = now
-        o = orion()
-        if o:
-            o["last_seen"] = now
-            save_orion(o)
+        with _orion_lock:   # read and written in one go, and only while it's still this key (not after a re-pair)
+            o = _load(ORION_FILE, None)
+            if isinstance(o, dict) and o.get("key") == entry["key"]:
+                o["last_seen"] = now
+                _save(ORION_FILE, o)
     return {"ok": True, "box": seal(key, {"ok": ok, "text": text, "data": data}, reply_aad)}
 
 
@@ -1761,7 +1968,13 @@ class _Input(ctypes.Structure):
 
 
 # Where typing words could run them: a terminal. Refused.
-_TERMINAL_CLASSES = {"ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "mintty", "PuTTY", "VirtualConsoleClass"}
+_TERMINAL_CLASSES = {"ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "mintty", "PuTTY", "VirtualConsoleClass",
+                     "org.wezfurlong.wezterm"}
+# Programs that run what's typed in them: terminals, PowerShell ISE, and Task Manager (its "Run new task").
+_TERMINAL_EXES = {"windowsterminal.exe", "wt.exe", "openconsole.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
+                  "powershell_ise.exe", "conhost.exe", "mintty.exe", "putty.exe", "kitty.exe", "alacritty.exe",
+                  "wezterm.exe", "wezterm-gui.exe", "hyper.exe", "tabby.exe", "conemu.exe", "conemu64.exe",
+                  "cmder.exe", "fluent terminal.exe", "warp.exe", "wsl.exe", "wslhost.exe", "bash.exe", "taskmgr.exe"}
 MAX_TYPE = 2000
 
 
@@ -1788,8 +2001,12 @@ def act_type(args):
     pid = wintypes.DWORD()
     _u32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
     exe = _exe_of(pid.value) or ""
-    if cls.value in _TERMINAL_CLASSES or Path(exe).name.lower() in {"windowsterminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "conhost.exe"}:
+    exe_name = Path(exe).name.lower()
+    if cls.value in _TERMINAL_CLASSES or exe_name in _TERMINAL_EXES:
         return False, "A terminal is in front on the PC; I won't type into one.", None
+    if cls.value == "#32770" and exe_name == "explorer.exe":
+        # Win+R's Run box (a dialog of Explorer's own): what's typed there runs.
+        return False, "The Run box is in front on the PC; I won't type into it.", None
     app = app_name(exe) if exe else "the window in front"
     events = []
     for ch in text.replace("\r\n", "\n").replace("\r", "\n"):
@@ -1892,7 +2109,36 @@ UPLOAD_IDLE_S = 600                 # an upload with no piece for this long is d
 
 _uploads: dict[str, dict] = {}
 _uploads_lock = threading.Lock()
+_name_lock = threading.Lock()
 on_received = lambda name, path: None  # the tray's "Received photo.jpg" note, set by the UI
+# What "send it and open it" may open: documents, pictures, music and videos. Anything else (a program, a script, a
+# shortcut, a web page…) is shown in its folder instead: a file the phone sends must never run on the PC.
+OPENABLE = {".pdf", ".txt", ".md", ".rtf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp",
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif", ".tif", ".tiff",
+            ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus",
+            ".mp4", ".mkv", ".mov", ".avi", ".webm", ".3gp", ".m4v"}
+
+
+def _mark_from_internet(path: Path) -> None:
+    """Marks a received file as from another computer (Mark of the Web), so Windows and Office treat it with care."""
+    try:
+        with open(f"{path}:Zone.Identifier", "w", encoding="ascii") as f:
+            f.write("[ZoneTransfer]\r\nZoneId=3\r\n")
+    except OSError:
+        pass   # not NTFS (a FAT USB drive): nothing to mark with
+
+
+def clean_stale_uploads() -> None:
+    """Half-received files left by a crash or a restart (.incoming-*.part): no upload can finish them now."""
+    try:
+        parts = list(RECEIVED_DIR.glob(".incoming-*.part"))
+    except OSError:
+        return
+    for part in parts:
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _safe_name(name: str) -> str:
@@ -1960,20 +2206,27 @@ def act_file_end(args):
     if u["got"] != u["size"]:
         Path(u["tmp"]).unlink(missing_ok=True)
         return False, "The file didn't arrive whole. Send it again.", None
-    target = RECEIVED_DIR / u["name"]
-    stem, suffix, n = target.stem, target.suffix, 1
-    while target.exists():  # never overwrite: photo.jpg, photo (2).jpg, …
-        n += 1
-        target = RECEIVED_DIR / f"{stem} ({n}){suffix}"
-    Path(u["tmp"]).replace(target)
+    with _name_lock:   # two of the same name finishing together: each gets its own name
+        target = RECEIVED_DIR / u["name"]
+        stem, suffix, n = target.stem, target.suffix, 1
+        while target.exists():  # never overwrite: photo.jpg, photo (2).jpg, …
+            n += 1
+            target = RECEIVED_DIR / f"{stem} ({n}){suffix}"
+        Path(u["tmp"]).replace(target)
+    _mark_from_internet(target)
     log.info("received a file (%d KB)", u["size"] // 1024)
     try:
         on_received(target.name, str(target))
     except Exception:
         log.exception("received-file note failed")
     if args.get("open"):
-        os.startfile(target)
-        return True, f"Saved {target.name} to Downloads, From phone, and opened it.", {"path": str(target)}
+        if target.suffix.lower() in OPENABLE:
+            os.startfile(target)
+            return True, f"Saved {target.name} to Downloads, From phone, and opened it.", {"path": str(target)}
+        # Anything that could run (a program, a script, a shortcut…) is only shown, never started from here.
+        subprocess.Popen(f'explorer.exe /select,"{target}"')
+        return True, (f"Saved {target.name} to Downloads, From phone. It isn't a document or picture, so it's shown "
+                      "in its folder rather than opened."), {"path": str(target)}
     return True, f"Saved {target.name} to Downloads, From phone.", {"path": str(target)}
 
 
@@ -2258,7 +2511,8 @@ class Agents:
             self.cond.notify_all()
         log.info("%s: %s", AGENT_NAMES.get(agent, agent), state)
 
-    def snapshot(self) -> dict:
+    def snapshot(self, device: str | None = None) -> dict:
+        """Everything for the phone; [device]: only the events for that phone (an event "to" one phone is its alone)."""
         now = time.time()
         with self.cond:
             for k in [k for k, v in self.sessions.items() if now - v["seen"] > AGENT_FORGET_S]:
@@ -2266,13 +2520,14 @@ class Agents:
             sessions = [{"key": k, "agent": AGENT_NAMES.get(v["agent"], v["agent"].title()), "project": v["project"],
                          "state": v["state"], "ago": int(now - v["since"]), "change": v["change"], "took": v.get("took", 0)}
                         for k, v in sorted(self.sessions.items(), key=lambda kv: -kv[1]["since"])]
-            events = [{k: v for k, v in e.items() if k != "at"} for e in self.events if now - e["at"] < EVENT_FRESH_S]
+            events = [{k: v for k, v in e.items() if k not in ("at", "to")} for e in self.events
+                      if now - e["at"] < EVENT_FRESH_S and (device is None or e.get("to") in (None, device))]
             return {"v": self.version, "idle": idle_seconds(), "sessions": sessions, "events": events, "last_event": self.event_id}
 
-    def wait(self, since: int, timeout: float) -> dict:
+    def wait(self, since: int, timeout: float, device: str | None = None) -> dict:
         with self.cond:
             self.cond.wait_for(lambda: self.version != since, timeout)
-        return self.snapshot()
+        return self.snapshot(device)
 
 
 AGENTS = Agents()
@@ -2306,7 +2561,7 @@ def _agent_words(a: dict) -> str:
 
 
 def act_agents(args):
-    snap = AGENTS.snapshot()
+    snap = AGENTS.snapshot(getattr(_request, "device", None))
     if not snap["sessions"]:
         if not agent_hooks_on() and not orion():
             return True, (f"Not watching AI agents on {PC_NAME}: turn on Watch AI agents in the JARVIS Link tray menu. "
@@ -2321,9 +2576,10 @@ def act_agents_wait(args):
         since = int(args.get("since", -1))
     except (TypeError, ValueError):
         since = -1
-    _phone_seen["t"] = time.time()
+    device = getattr(_request, "device", None)
+    _phone_seen.update(t=time.time(), device=device)
     try:
-        return True, "", AGENTS.wait(since, AGENT_WAIT_S)
+        return True, "", AGENTS.wait(since, AGENT_WAIT_S, device)
     finally:
         _phone_seen["t"] = time.time()
 
@@ -2435,7 +2691,11 @@ def antigravity_command(event: str) -> str:
     Antigravity's hook command: short paths, because it hands the command to cmd.exe with its quotes escaped (a path
     with a space, like "AI ASSISTANTS", then isn't found); and the event named, because its payload doesn't say which.
     """
-    return f"{_short_path(_hook_python())} -S {_short_path(str(HOOK_SCRIPT))} antigravity {event}"
+    def arg(path: str) -> str:
+        short = _short_path(path)
+        # No 8.3 name (switched off on some drives): quoted, the only way left for a path with a space to work at all.
+        return f'"{short}"' if " " in short else short
+    return f"{arg(_hook_python())} -S {arg(str(HOOK_SCRIPT))} antigravity {event}"
 
 
 def _ours(entry) -> bool:
@@ -2511,7 +2771,12 @@ def agent_hooks_on() -> bool:
     except OSError:
         pass
     try:
-        return '"jarvis-link"' in ANTIGRAVITY_HOOKS.read_text("utf-8")
+        if '"jarvis-link"' in ANTIGRAVITY_HOOKS.read_text("utf-8"):
+            return True
+    except OSError:
+        pass
+    try:   # Codex alone (a PC without the other two): its notify line is ours
+        return any(ln.startswith("notify") and "agent_hook.py" in ln for ln in CODEX_CONFIG.read_text("utf-8").splitlines())
     except OSError:
         return False
 
@@ -2602,10 +2867,30 @@ TAILSCALE_EXE = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Tai
 _tail_cache: dict = {"at": 0.0, "ips": []}
 
 
+_tail_refreshing = threading.Lock()
+
+
 def tailscale_ips() -> list[str]:
-    """This PC's Tailscale address(es); [] when Tailscale isn't installed or isn't signed in. Cached for 30 s."""
+    """
+    This PC's Tailscale address(es); [] when Tailscale isn't installed or isn't signed in. Cached for 30 s, and
+    refreshed in the background after the first look: asking Tailscale can take seconds, and a phone's request
+    mustn't wait for it.
+    """
     if time.time() - _tail_cache["at"] < 30:
         return _tail_cache["ips"]
+    if _tail_cache["at"] == 0.0:   # never looked (or just switched on): look now
+        return _tailscale_look()
+    if _tail_refreshing.acquire(blocking=False):
+        def refresh():
+            try:
+                _tailscale_look()
+            finally:
+                _tail_refreshing.release()
+        threading.Thread(target=refresh, daemon=True).start()
+    return _tail_cache["ips"]
+
+
+def _tailscale_look() -> list[str]:
     ips: list[str] = []
     try:
         import ifaddr
@@ -2699,24 +2984,77 @@ def write_frame(sock: socket.socket, obj: dict) -> None:
     sock.sendall(struct.pack(">I", len(data)) + data)
 
 
+MAX_CONNECTIONS = 16          # open at once from one address (a phone uses a few); more are dropped
+_connections: dict[str, int] = {}
+_connections_lock = threading.Lock()
+
+
+def peer_allowed(peer: str, local: str) -> bool:
+    """
+    Home network only, plus your own Tailscale when "Work on any network" is on, and only when it arrived on this
+    PC's Tailscale address: a 100.64/10 address on a hotspot or a carrier's network isn't someone's Tailscale.
+    """
+    if re.match(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.)", peer):
+        return True
+    return bool(CONFIG.get("any_network") and TAILNET_IP.match(peer) and local in tailscale_ips())
+
+
+def _peer_gone(sock: socket.socket) -> bool:
+    """The other end has closed (Orion quit or restarted while waiting)."""
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+        return bool(readable) and sock.recv(1, socket.MSG_PEEK) == b""
+    except OSError:
+        return True
+
+
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
         self.request.settimeout(15)
         peer = self.client_address[0]
-        # Home network only, plus your own Tailscale when "Work on any network" is on: anything else is dropped unanswered.
-        home = re.match(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.)", peer)
-        tail = CONFIG.get("any_network") and TAILNET_IP.match(peer)
-        if not (home or tail) or STRIKES.banned(peer):
+        refresh_config()
+        try:
+            local = self.request.getsockname()[0]
+        except OSError:
             return
+        # Anything else is dropped unanswered.
+        if not peer_allowed(peer, local) or STRIKES.banned(peer):
+            return
+        with _connections_lock:
+            if _connections.get(peer, 0) >= MAX_CONNECTIONS and peer != "127.0.0.1":
+                return
+            _connections[peer] = _connections.get(peer, 0) + 1
+        try:
+            self._serve(peer)
+        finally:
+            with _connections_lock:
+                left = _connections.get(peer, 1) - 1
+                if left > 0:
+                    _connections[peer] = left
+                else:
+                    _connections.pop(peer, None)
+
+    def _serve(self, peer: str):
         try:
             first = True
             while True:
+                if STRIKES.banned(peer):
+                    return
                 try:
                     req = read_frame(self.request)
                 except (socket.timeout, ConnectionError):
                     return
+                except ValueError:   # not JSON, or not UTF-8: not a phone; a strike, and a short line in the log
+                    log.warning("%s sent a frame that isn't JSON", peer)
+                    STRIKES.add(peer)
+                    return
                 if not req:
                     return
+                if not isinstance(req, dict):
+                    log.warning("%s sent a frame that isn't a request", peer)
+                    STRIKES.add(peer)
+                    return
+                _request.taken = None
                 t = req.get("t")
                 if t == "hello":
                     reply = {"ok": True, "id": AGENT_ID, "name": PC_NAME, "v": VERSION}
@@ -2732,7 +3070,16 @@ class Handler(socketserver.BaseRequestHandler):
                     reply = handle_orion(req)
                 else:
                     reply = {"ok": False, "error": "unknown"}
-                write_frame(self.request, reply)
+                taken = _request.taken
+                if taken and _peer_gone(self.request):   # Orion went while it waited: its mail stays for the next wait
+                    ORION_STATE.give_back(taken)
+                    return
+                try:
+                    write_frame(self.request, reply)
+                except OSError:
+                    if taken:
+                        ORION_STATE.give_back(taken)
+                    return
                 if first:
                     # Kept open for the next request (the touchpad), and closed after a minute of nothing.
                     first = False
@@ -2867,9 +3214,7 @@ def run_ui():
         shown: dict = {"sig": None}
 
         def forget(device: str, name: str):
-            p = paired()
-            p.pop(device, None)
-            save_paired(p)
+            update_paired(lambda p: p.pop(device, None) is not None)
             log.info("removed %s", name)
             draw_phones(force=True)
             try:
@@ -3155,14 +3500,14 @@ def run_ui():
 
     def toggle_config(key):
         def flip(icon_, item):
-            CONFIG[key] = not CONFIG.get(key, True)
-            _save(CONFIG_FILE, CONFIG)
+            if not update_config(**{key: not CONFIG.get(key, True)}):
+                notice("Changed until JARVIS Link restarts: config.json has a mistake in it, so it wasn't saved.")
             jobs.put(icon.update_menu)
         return flip
 
     def set_any_network(on: bool):
-        CONFIG["any_network"] = on
-        _save(CONFIG_FILE, CONFIG)
+        if not update_config(any_network=on):
+            notice("Changed until JARVIS Link restarts: config.json has a mistake in it, so it wasn't saved.")
         _tail_cache["at"] = 0.0
         log.info("work on any network: %s", "on" if on else "off")
         if on and not tailscale_ips():
@@ -3294,6 +3639,8 @@ def run_ui():
         root.after(200, pump)
 
     pump()
+    if CONFIG_PROBLEM:
+        root.after(2000, lambda: notice(CONFIG_PROBLEM))
     if not paired():
         root.after(800, lambda: show_window(pair_now=True))
     root.mainloop()
@@ -3310,6 +3657,7 @@ def main():
     except OSError:
         already_running()
         return
+    clean_stale_uploads()   # before any upload starts: none of these can be in use
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=advertise, daemon=True).start()
     threading.Thread(target=start_apps, daemon=True).start()  # so the first "open …" needn't wait for it

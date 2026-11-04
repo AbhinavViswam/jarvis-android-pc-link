@@ -38,7 +38,7 @@ def cmd(action, args=None, k=key, dev=device):
 
 print(cmd("status"))
 print(cmd("list_projects")["text"][:120])
-print(cmd("open_url", {"url": "file:///C:/Windows"}))
+assert not cmd("open_url", {"url": "file:///C:/Windows"})["ok"]  # web links only
 print(cmd("nope"))
 # A stranger's key, and a replayed request, are refused.
 assert cmd("status", k=secrets.token_bytes(32)) == {"ok": False, "error": "not paired"}
@@ -74,6 +74,24 @@ for attempt in range(2):
 print(sorted(p.name for p in L.RECEIVED_DIR.iterdir()))
 assert (L.RECEIVED_DIR / "photo.jpg").read_bytes() == blob and (L.RECEIVED_DIR / "photo (2).jpg").exists()
 assert not cmd("file_begin", {"name": "x", "size": 10**10})["ok"]
+# Marked as from another computer; "open" opens a document or picture, and only shows anything that could run.
+assert "ZoneId=3" in open(str(L.RECEIVED_DIR / "photo.jpg") + ":Zone.Identifier").read()
+started, shown_in = [], []
+real_startfile, real_popen = L.os.startfile, L.subprocess.Popen
+L.os.startfile, L.subprocess.Popen = started.append, shown_in.append
+try:
+    for name in ("notes.pdf", "run.bat", "evil.lnk", "page.HTA"):
+        up = cmd("file_begin", {"name": name, "size": 3})["data"]["upload"]
+        cmd("file_chunk", {"upload": up, "index": 0, "data": base64.b64encode(b"abc").decode()})
+        assert cmd("file_end", {"upload": up, "open": True})["ok"]
+finally:
+    L.os.startfile, L.subprocess.Popen = real_startfile, real_popen
+assert [Path(p).name for p in started] == ["notes.pdf"], started
+assert len(shown_in) == 3 and all(s.startswith("explorer.exe /select,") for s in shown_in), shown_in
+# Half-received files a crash left behind are cleaned at start.
+(L.RECEIVED_DIR / ".incoming-dead.part").write_bytes(b"x")
+L.clean_stale_uploads()
+assert not (L.RECEIVED_DIR / ".incoming-dead.part").exists() and (L.RECEIVED_DIR / "photo.jpg").exists()
 # Back to the phone: only from the shared folders, chosen from the list the PC gave.
 L.CONFIG["share_folders"] = {"From phone": str(L.RECEIVED_DIR)}
 listed = cmd("find_files", {"kind": "image"})
@@ -160,6 +178,18 @@ v = cmd("agents_wait", {"since": -1})["data"]["v"]
 assert cmd("agents_wait", {"since": v})["data"]["v"] == v
 # Only this PC's own hook may report: the same frame from the network is refused (tested by its rule, not a real LAN).
 assert call({"t": "agent", "agent": "claude", "session": "x", "state": "done"}) == {"ok": True}  # 127.0.0.1 here
+# Who may connect at all: the home network; Tailscale only when switched on and arriving on this PC's Tailscale address.
+assert L.peer_allowed("192.168.1.5", "192.168.1.2") and L.peer_allowed("127.0.0.1", "127.0.0.1")
+assert not L.peer_allowed("8.8.8.8", "192.168.1.2") and not L.peer_allowed("100.70.0.9", "100.80.0.1")
+L.CONFIG["any_network"], L._tail_cache["at"], L._tail_cache["ips"] = True, time.time(), ["100.80.0.1"]
+assert L.peer_allowed("100.70.0.9", "100.80.0.1") and not L.peer_allowed("100.70.0.9", "192.168.1.2")
+L.CONFIG["any_network"], L._tail_cache["at"], L._tail_cache["ips"] = False, 0.0, []
+# Garbage instead of a frame: the connection is dropped, quietly, and the next request is answered as usual.
+s = socket.create_connection(("127.0.0.1", L.PORT), timeout=5)
+s.sendall(struct.pack(">I", 5) + b"\xff\xfe{{{")
+assert s.recv(10) == b""
+s.close()
+assert call({"t": "hello"})["id"] == L.AGENT_ID
 # Setting up the hooks keeps the user's own ones, and taking ours out leaves the file as it was.
 home = Path(os.environ["APPDATA"]) / "home"
 L.CLAUDE_SETTINGS = home / ".claude" / "settings.json"
@@ -184,6 +214,10 @@ assert len(json.loads(L.CLAUDE_SETTINGS.read_text("utf-8"))["hooks"]["Stop"]) ==
 print(L.set_agent_hooks(False))
 assert json.loads(L.CLAUDE_SETTINGS.read_text("utf-8")) == mine and not L.agent_hooks_on()
 assert L.CODEX_CONFIG.read_text("utf-8") == 'model = "gpt"\n\n[profiles.x]\nmodel = "y"\n'
+L.CODEX_CONFIG.write_text("notify = " + json.dumps(["py", "-S", "agent_hook.py", "codex"]) + "\n", "utf-8")
+assert L.agent_hooks_on()   # Codex alone counts too, so the tray can turn it off
+L.set_agent_hooks(False)
+assert not L.agent_hooks_on() and L.CODEX_CONFIG.read_text("utf-8") == ""
 # the phone's companions: battery news once per charge / discharge; events ride on the agents' wait
 assert L.battery_news(20, False, None) == ("low", "low") and L.battery_news(12, False, "low") == (None, "low")
 assert L.battery_news(100, True, "low") == ("full", "full") and L.battery_news(60, False, "full") == (None, None)
@@ -384,6 +418,8 @@ orion("push", okey, what="note", text="x", url="javascript:alert(1)", file={"id"
 ev = L.AGENTS.snapshot()["events"][-1]
 assert "url" not in ev and "file" not in ev
 assert not orion("offer", okey, path=str(outside) + ".nope")["ok"]
+assert not orion("offer", okey, path=str(L.ORION_FILE))["ok"]    # never JARVIS Link's own keys
+assert not orion("offer", okey, path=str(L.PAIRED_FILE))["ok"]
 
 # Phase 3: Orion gives the phone a task; the phone (listening on agents_wait) answers.
 L._phone_seen["t"] = 0
@@ -419,6 +455,9 @@ r = orion("phone_ask", okey, action="battery", wait_s=5)
 th.join(5)
 assert r["data"]["state"] == "completed" and r["text"] == "82%, charging" and r["data"]["data"]["percent"] == 82, r
 assert got[0]["action"] == "battery" and got[0]["task"].startswith("p-")
+# Only the phone listening (this one) gets Orion's task: another paired phone never sees it.
+tasks_for = lambda dev: [e for e in L.AGENTS.snapshot(dev)["events"] if e.get("what") == "task"]
+assert tasks_for(device) and not tasks_for("old-phone") and all("to" not in e for e in tasks_for(device))
 mail = orion("wait", okey, wait_s=0.2)["data"]["tasks"]
 assert [m["kind"] for m in mail] == ["phone_answer"] and mail[0]["action"] == "battery"   # Orion ignores it (answered inline)
 # Late, with "in use" first: Orion hears the update and then the answer in its mailbox.
@@ -482,6 +521,47 @@ assert [(e["type"], e.get("ok"), e.get("facts")) for e in evs] == [("talk_done",
 assert not orion("event", okey, type="talk_request", moment="asked")["ok"]   # only the phone asks Orion
 L.ORION_STATE.seen = 0
 assert not cmd("orion_event", {"type": "phone_idle"})["ok"]                 # Orion not running: dropped
+
+# Orion's long wait: a newer wait (Orion after a restart) takes over, and gets the mail; the older one gets nothing.
+old_wait, new_wait = [], []
+L.ORION_STATE.take(0)   # nothing left over from above
+t1 = threading.Thread(target=lambda: old_wait.append(L.ORION_STATE.take(5)))
+t1.start()
+time.sleep(0.2)
+t2 = threading.Thread(target=lambda: new_wait.append(L.ORION_STATE.take(5)))
+t2.start()
+time.sleep(0.2)
+L.ORION_STATE.put({"id": "t-new", "deadline": time.time() + 60})
+t1.join(5)
+t2.join(5)
+assert old_wait == [[]] and [t["id"] for t in new_wait[0]] == ["t-new"], (old_wait, new_wait)
+L.ORION_STATE.give_back([{"id": "t-back", "deadline": time.time() + 60}])
+assert [t["id"] for t in L.ORION_STATE.take(1)] == ["t-back"]
+
+# A request recorded on the network can't be played again after JARVIS Link restarts.
+nonce = secrets.token_bytes(12)
+assert L.REPLAYS.fresh(nonce) and not L.Replays(L.REPLAYS._path).fresh(nonce)
+
+# Settings: edits in config.json are picked up without a restart; a broken one is never overwritten and never
+# changes this PC's id; a tray switch saves on top of the user's edits.
+cfg = json.loads(L.CONFIG_FILE.read_text("utf-8"))
+cfg["editor"] = "notepad"
+L.CONFIG_FILE.write_text(json.dumps(cfg), "utf-8")
+os.utime(L.CONFIG_FILE, ns=(time.time_ns(), time.time_ns() + 10**9))
+assert cmd("status")["ok"] and L.CONFIG["editor"] == "notepad"
+assert L.update_config(battery_alerts=False)
+saved = json.loads(L.CONFIG_FILE.read_text("utf-8"))
+assert saved["editor"] == "notepad" and saved["battery_alerts"] is False and saved["id"] == L.AGENT_ID
+broken = r'{"workspaces": {"Abhi": "C:\DILSHA\ABHI"}, "id": "' + L.AGENT_ID + '"}'   # a single \ as the old README had
+L.CONFIG_FILE.write_text(broken, "utf-8")
+os.utime(L.CONFIG_FILE, ns=(time.time_ns(), time.time_ns() + 2 * 10**9))
+L.refresh_config()
+assert L.CONFIG_PROBLEM and L.CONFIG["editor"] == "notepad" and L.CONFIG_BAD.read_text("utf-8") == broken
+assert not L.update_config(share_clipboard=False) and L.CONFIG["share_clipboard"] is False
+assert L.CONFIG_FILE.read_text("utf-8") == broken                       # never overwritten
+assert L.load_config()["id"] == L.AGENT_ID and L.CONFIG_FILE.read_text("utf-8") == broken
+L.ID_FILE.unlink()                                                       # as before the update: the id only in config.json
+assert L.load_config()["id"] == L.AGENT_ID and L.ID_FILE.read_text("utf-8") == L.AGENT_ID
 
 print("ALL OK")
 server.shutdown()

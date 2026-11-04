@@ -54,8 +54,13 @@ Codex reports only finished. Another agent can report too: `python -S agent_hook
 
 ## Settings
 Tray → **Settings (folders)…** opens `%APPDATA%\JARVIS Link\config.json`:
-- `workspaces`: named folders searched for projects (a folder with .git, package.json, build.gradle, pyproject…), e.g. `{"Abhi": "C:\DILSHA\ABHI", "RateUp": "C:\DILSHA\rateup-abhi"}` — "open the RateUp api" picks rateup-api there.
-- `aliases`: your own names, e.g. `"jarvis": "C:\...\jarvis-android"`.
+- `workspaces`: named folders searched for projects (a folder with .git, package.json, build.gradle, pyproject…), e.g. `{"Abhi": "C:\\DILSHA\\ABHI", "RateUp": "C:/DILSHA/rateup-abhi"}` — "open the RateUp api" picks rateup-api there.
+- `aliases`: your own names, e.g. `"jarvis": "C:\\...\\jarvis-android"`.
+
+In a path write `\\` or `/`, never a single `\` (that isn't valid JSON). Changes take effect when you save the file. If
+the file has a mistake, JARVIS Link keeps the settings it has (the defaults, if it was just started), copies the broken file to `config.json.bad` and
+tells you in the tray; it never overwrites your file. This PC's id (what phones and Orion know it by) is kept apart,
+in `%APPDATA%\JARVIS Link\id`, so a mistake here can never unpair anything.
 - `share_folders`: the only folders the phone may take files from (Downloads, Desktop, Documents, Pictures, Screenshots by default — the real ones, OneDrive included).
 - `editor`: `code` (VS Code) by default; `explorer` just opens the folder.
 - `any_network`: `false` by default; `true` also answers phones on your Tailscale (the window's switch sets it).
@@ -65,7 +70,9 @@ Tray → **Settings (folders)…** opens `%APPDATA%\JARVIS Link\config.json`:
 - Every request/reply is AES-256-GCM encrypted with that phone's key, time-stamped, replay-checked.
 - Only the fixed actions in `ACTIONS` exist; nothing sent is ever run as a command.
 - Home-network addresses only, plus your own Tailscale (100.64.0.0/10) when **Work on any network** is on.
-- An address that sends 10 requests with the wrong key within 10 minutes is ignored for 10 minutes.
+- An address that sends 10 requests with the wrong key (or garbage) within 10 minutes is ignored for 10 minutes.
+- Files from the phone are marked as from another computer (like a download). "Send and open" opens documents,
+  pictures, music and videos only; anything else is shown in its folder, never run.
 - Log: tray → Open log.
 
 `.venv\Scripts\python test_link.py` pairs a pretend phone and runs the actions (uses a temporary folder, not your pairing).
