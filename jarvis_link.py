@@ -415,7 +415,7 @@ class Strikes:
 STRIKES = Strikes()
 
 # Many to a second, or one piece of a file: not written to the log one by one.
-QUIET_ACTIONS = {"file_chunk", "file_get_chunk", "pointer", "key", "agents_wait", "phone_notify", "orion_get", "orion_answer", "orion_event"}
+QUIET_ACTIONS = {"hello", "file_chunk", "file_get_chunk", "pointer", "key", "agents_wait", "phone_notify", "orion_get", "orion_answer", "orion_event"}
 _last_seen_saved: dict[str, int] = {}
 
 
@@ -856,6 +856,21 @@ def phone_listening() -> bool:
     return time.time() - _phone_seen["t"] < PHONE_LISTENING_S
 
 
+# JARVIS running on a phone: its watcher listening (above), or its plain check-in ("hello", every 40 s or so while
+# it runs). Only for showing that JARVIS is there: Orion's phone tasks still need the watcher (phone_listening).
+_jarvis_seen = {"t": 0.0}
+
+
+def jarvis_running() -> bool:
+    return phone_listening() or time.time() - _jarvis_seen["t"] < PHONE_LISTENING_S
+
+
+def act_hello(args):
+    """A running JARVIS checking in, so Orion can show it's there."""
+    _jarvis_seen["t"] = time.time()
+    return True, "", None
+
+
 def act_orion_answer(args):
     """The phone's answer to a task Orion gave it (Phase 3): kept for Orion's wait, and put in its mailbox."""
     tid = str(args.get("id", ""))
@@ -1067,7 +1082,8 @@ def orion_op(op: str, body: dict) -> tuple[bool, str, object]:
         _request.taken = tasks   # given back if the answer can't reach Orion (the handler)
         return True, "", {"tasks": tasks}
     if op == "status":
-        return True, "", {"phones": len(paired()), "pc_name": PC_NAME, "phone_listening": phone_listening()}
+        return True, "", {"phones": len(paired()), "pc_name": PC_NAME, "phone_listening": phone_listening(),
+                          "jarvis_running": jarvis_running()}
     return False, f"JARVIS Link doesn't know {op}.", None
 
 
@@ -2805,6 +2821,7 @@ def set_agent_hooks(on: bool) -> str:
 
 ACTIONS = {
     "status": act_status,
+    "hello": act_hello,
     "list_projects": act_list_projects,
     "open_project": act_open_project,
     "open_app": act_open_app,
